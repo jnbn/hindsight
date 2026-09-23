@@ -1104,18 +1104,93 @@ A document file:
 
 Metadata and dates live on each fact; a document carries no metadata or timestamp of its own. Re-sending a document id follows `document_conflict` (`replace` to overwrite it).
 
-```python
+### Python
 
+```python
+import io
+import json
+import zipfile
+
+doc = {
+    "id": "session-2026-09-22",
+    "original_text": "Full original session text...",
+    "chunks": [{"chunk_index": 0, "chunk_text": "Caller-defined source region..."}],
+    "facts": [
+        {
+            "text": "The user prefers lightweight local speech recognition models.",
+            "fact_type": "experience",
+            "chunk_index": 0,
+            "mentioned_at": "2026-09-22T18:34:00Z",
+            "entities": ["Parakeet"],
+        }
+    ],
+}
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, "w") as z:
     z.writestr("manifest.json", json.dumps({"schema_version": 1, "source_bank_id": "external"}))
-    z.writestr(f"documents/{doc['id']}.json", json.dumps(doc))  # doc = the dict above
+    z.writestr(f"documents/{doc['id']}.json", json.dumps(doc))
 
-requests.post(
-    f"{HINDSIGHT_URL}/v1/default/banks/my-bank/transfer/import",
-    params={"mode": "merge", "document_conflict": "replace"},
-    files={"file": ("import.zip", buf.getvalue(), "application/zip")},
-)  # -> {"operation_id": "…"}; poll the bank's operations endpoint
+submission = await client.bank_transfer.import_bank_transfer(
+    "transfer-py-other",
+    ("import.zip", buf.getvalue()),
+    mode="merge",
+    document_conflict="replace",
+)
+```
+
+### CLI
+
+```bash
+mkdir -p external/documents
+echo '{"schema_version": 1, "source_bank_id": "external"}' > external/manifest.json
+cat > external/documents/session-2026-09-22.json <<'JSON'
+{
+  "id": "session-2026-09-22",
+  "original_text": "Full original session text...",
+  "chunks": [{"chunk_index": 0, "chunk_text": "Caller-defined source region..."}],
+  "facts": [{
+    "text": "The user prefers lightweight local speech recognition models.",
+    "fact_type": "experience",
+    "chunk_index": 0,
+    "mentioned_at": "2026-09-22T18:34:00Z",
+    "entities": ["Parakeet"]
+  }]
+}
+JSON
+(cd external && zip -qr ../import.zip manifest.json documents)
+
+curl --fail-with-body -H "Authorization: Bearer $API_KEY" -F "file=@import.zip" \
+  "$HINDSIGHT_URL/v1/default/banks/transfer-other-bank/transfer/import?mode=merge&document_conflict=replace"
+```
+
+### Go
+
+```go
+doc := map[string]any{
+	"id":            "session-2026-09-22",
+	"original_text": "Full original session text...",
+	"chunks":        []map[string]any{{"chunk_index": 0, "chunk_text": "Caller-defined source region..."}},
+	"facts": []map[string]any{{
+		"text":         "The user prefers lightweight local speech recognition models.",
+		"fact_type":    "experience",
+		"chunk_index":  0,
+		"mentioned_at": "2026-09-22T18:34:00Z",
+		"entities":     []string{"Parakeet"},
+	}},
+}
+zipPath := filepath.Join(os.TempDir(), "import.zip")
+out, _ := os.Create(zipPath)
+zw := zip.NewWriter(out)
+w, _ := zw.Create("manifest.json")
+json.NewEncoder(w).Encode(map[string]any{"schema_version": 1, "source_bank_id": "external"})
+w, _ = zw.Create("documents/session-2026-09-22.json")
+json.NewEncoder(w).Encode(doc)
+zw.Close()
+out.Close()
+
+file, _ = os.Open(zipPath)
+external, _, err := client.BankTransferAPI.ImportBankTransfer(ctx, "transfer-go-other").
+	File(file).Mode("merge").DocumentConflict("replace").Execute()
 ```
 
 ### Clone a bank

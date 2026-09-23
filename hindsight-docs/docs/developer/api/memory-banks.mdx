@@ -761,20 +761,17 @@ A document file:
 
 Metadata and dates live on each fact; a document carries no metadata or timestamp of its own. Re-sending a document id follows `document_conflict` (`replace` to overwrite it).
 
-```python
-import io, json, zipfile, requests
-
-buf = io.BytesIO()
-with zipfile.ZipFile(buf, "w") as z:
-    z.writestr("manifest.json", json.dumps({"schema_version": 1, "source_bank_id": "external"}))
-    z.writestr(f"documents/{doc['id']}.json", json.dumps(doc))  # doc = the dict above
-
-requests.post(
-    f"{HINDSIGHT_URL}/v1/default/banks/my-bank/transfer/import",
-    params={"mode": "merge", "document_conflict": "replace"},
-    files={"file": ("import.zip", buf.getvalue(), "application/zip")},
-)  # -> {"operation_id": "…"}; poll the bank's operations endpoint
-```
+<Tabs>
+<TabItem value="python" label="Python">
+<CodeSnippet code={memoryBanksPy} section="transfer-import-external" language="python" />
+</TabItem>
+<TabItem value="cli" label="CLI">
+<CodeSnippet code={memoryBanksSh} section="transfer-import-external" language="bash" />
+</TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={memoryBanksGo} section="transfer-import-external" language="go" />
+</TabItem>
+</Tabs>
 
 ### Clone a bank
 
