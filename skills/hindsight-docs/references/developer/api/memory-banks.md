@@ -1054,7 +1054,7 @@ A restore carries the operations log as history, not as work: anything still in 
 
 ### Import facts extracted outside Hindsight
 
-An archive doesn't have to come from an export. If you run your own extraction pipeline, build the archive yourself and import it with `mode=merge`: your chunks and facts are stored as given — no LLM call, no re-chunking — while Hindsight still re-embeds the facts, resolves their entities against the bank, builds the semantic, temporal and entity links, and runs consolidation over them afterwards.
+An archive doesn't have to come from an export. If you run your own extraction pipeline, build the archive yourself and import it with `mode=merge`: your chunks and facts are stored as given — no LLM call, no re-chunking — while Hindsight still re-embeds the facts, resolves their entities against the bank, builds the semantic, temporal, entity and causal links, and — like a retain — fires `retain.completed` webhooks and auto-consolidation when the bank has them enabled.
 
 The archive is a ZIP with a `manifest.json` and one JSON file per document under `documents/`:
 
