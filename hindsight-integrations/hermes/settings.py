@@ -130,3 +130,39 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
         logger.warning("Invalid bank_id_template %r: %s — using fallback %r", template, exc, fallback)
         return fallback
     return re.sub(r"([-_])\1+", r"\1", rendered).strip("-_") or fallback
+
+
+def _discover_cwd_bank_id(start_dir: str | None = None) -> str | None:
+    """Walk up from *start_dir* to the filesystem root, returning the first
+    ``.hindsight/config.toml`` found.
+
+    Reads only the ``bank_id`` key, parsed with stdlib ``tomllib``. Never raises:
+    an unreadable or malformed file logs a warning and the walk continues.
+    Returns ``None`` when nothing found.
+    """
+    if not start_dir:
+        return None
+
+    import tomllib
+    from pathlib import Path
+
+    try:
+        d = Path(start_dir).resolve()
+        for folder in (d, *d.parents):
+            candidate = folder / ".hindsight" / "config.toml"
+            if not candidate.is_file():
+                continue
+            try:
+                data = tomllib.loads(candidate.read_text(encoding="utf-8", errors="replace"))
+                bank = data.get("bank_id")
+                if isinstance(bank, str) and bank.strip():
+                    return bank.strip()
+                logger.warning("hindsight: %s has no usable bank_id — walking up", candidate)
+                continue
+            except Exception as exc:
+                logger.warning("hindsight: cannot read %s (%s) — walking up", candidate, exc)
+                continue
+    except Exception as exc:
+        logger.debug("hindsight: cwd walk failed: %s", exc)
+    return None
+

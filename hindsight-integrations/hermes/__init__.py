@@ -61,6 +61,7 @@ from .settings import (
     _normalize_retain_tags,
     _parse_int_setting,
     _resolve_bank_id_template,
+    _discover_cwd_bank_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -165,9 +166,14 @@ def _check_api_supports_update_mode_append(api_url: str, api_key: str | None = N
     """
     if not api_url:
         return False
-    from agent.credential_persistence import fingerprint_secret_value
+    try:
+        from agent.credential_persistence import fingerprint_secret_value
+        key_fp = fingerprint_secret_value(api_key)
+    except Exception:
+        import hashlib
+        key_fp = hashlib.sha256((api_key or "").encode()).hexdigest()[:16] if api_key else None
 
-    cache_key = (api_url, fingerprint_secret_value(api_key))
+    cache_key = (api_url, key_fp)
     with _append_capability_lock:
         if cache_key in _append_capability_cache:
             return _append_capability_cache[cache_key]
@@ -348,6 +354,7 @@ _SESSION_KWARGS = (
     "thread_id",
     "agent_identity",
     "agent_workspace",
+    "cwd",
 )
 # Retain metadata keys, each stamped from the attribute of the same name when set.
 _METADATA_ATTRS = (
@@ -399,6 +406,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout, self._idle_timeout = _DEFAULT_TIMEOUT, _DEFAULT_IDLE_TIMEOUT
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
         self._bank_mission, self._bank_retain_mission = "", None
+        self._mirror_to_own_bank = False
+        self._additional_bank_ids: list[str] = []
+        self._write_bank_ids: list[str] = ["hermes"]
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
         self._prefetch_method = "recall"  # "recall" or "reflect"
         for name in _SESSION_KWARGS:
@@ -420,6 +430,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._atexit_registered = False
         self._retain_tags: List[str] = []
         self._tags: list[str] | None = None
+        self._observation_scopes: Any = None
         self._retain_source = _DEFAULT_RETAIN_SOURCE
         self._retain_user_prefix, self._retain_assistant_prefix = "User", "Assistant"
         self._turn_counter = self._turn_index = 0
@@ -428,7 +439,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Server-side async retain ops still in flight: aretain_batch returns on
         # *acceptance*, not durability, so the prefetch gates on these via
         # get_operation_status (a drained local queue is not a read-after-write signal).
-        self._pending_retain_ops: set[str] = set()
+        self._pending_retain_ops: set[tuple[str, str]] = set()
         self._pending_retain_ops_lock = threading.Lock()
         self._retain_ops_bank_id = ""
         self._apply_retain_policy({})
@@ -816,15 +827,15 @@ class HindsightMemoryProvider(MemoryProvider):
     def _track_retain_ops(self, retain_response, bank_id: str) -> None:
         """Record the async ``operation_id``/``operation_ids`` of an aretain_batch reply
         (pending until recall-visible). No id (older API / sync completion) leaves
-        only the local queue drain as a signal."""
+        only the local queue drain as a signal. Keyed per ``(bank_id, op_id)`` so
+        multi-bank writes poll the status endpoint of the bank each op targets."""
         raw_ids = [
             getattr(retain_response, "operation_id", None),
             *(getattr(retain_response, "operation_ids", None) or []),
         ]
         if ids := [str(op) for op in raw_ids if op]:
-            self._retain_ops_bank_id = bank_id
             with self._pending_retain_ops_lock:
-                self._pending_retain_ops.update(ids)
+                self._pending_retain_ops.update((bank_id, op_id) for op_id in ids)
 
     def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
         """True when a server-side retain op is done or gone (completed ops are evicted,
@@ -872,20 +883,19 @@ class HindsightMemoryProvider(MemoryProvider):
         join). Trades a possibly-stale recall for liveness; WARNING once per prefetch."""
         while True:
             with self._pending_retain_ops_lock:
-                bank_id = self._retain_ops_bank_id or self._bank_id
                 pending = list(self._pending_retain_ops)
             if not pending:
                 return True
             if self._shutting_down.is_set():
                 return False
-            done: set[str] = set()
-            for op_id in pending:
+            done: set[tuple[str, str]] = set()
+            for bank_id, op_id in pending:
                 if self._shutting_down.is_set():
                     return False
                 if _expired():
                     break
                 if self._is_retain_op_complete(bank_id, op_id):
-                    done.add(op_id)
+                    done.add((bank_id, op_id))
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.difference_update(done)
                 if not self._pending_retain_ops:
@@ -1008,6 +1018,23 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._mode == "local_embedded":
             self._start_embedded_daemon()
 
+    def _build_write_bank_ids(self) -> list[str]:
+        """The deduped, ordered set of banks this provider writes to (and
+        recalls from, primary-first).
+
+        Order: primary ``_bank_id`` → own static bank when ``mirror_to_own_bank``
+        and different → each ``additional_banks`` entry. Deduped throughout.
+        With no multi-bank config this is exactly ``[_bank_id]``.
+        """
+        own = self._config.get("bank_id") if self._config else self._bank_id
+        ordered: list[str] = [self._bank_id]
+        if self._mirror_to_own_bank and own and own != self._bank_id:
+            ordered.append(own)
+        for bank in self._additional_bank_ids:
+            if bank not in ordered:
+                ordered.append(bank)
+        return ordered
+
     def _apply_connection_settings(self, cfg: dict) -> None:
         """Endpoint, bank and mode selectors from *cfg* (env fallbacks where documented)."""
         self._api_key = _cloud_api_key(cfg)
@@ -1017,15 +1044,27 @@ class HindsightMemoryProvider(MemoryProvider):
 
         banks = cfg_get(cfg, "banks", "hermes", default={})
         self._bank_id_template = cfg.get("bank_id_template", "") or ""
-        self._bank_id = _resolve_bank_id_template(
-            self._bank_id_template,
-            fallback=cfg.get("bank_id") or banks.get("bankId", "hermes"),
-            profile=self._agent_identity,
-            workspace=self._agent_workspace,
-            platform=self._platform,
-            user=self._user_id,
-            session=self._session_id,
-        )
+        # Precedence: closest .hindsight/config.toml → template → static bank_id.
+        cwd_bank = _discover_cwd_bank_id(self._cwd) if getattr(self, "_cwd", None) else None
+        if cwd_bank:
+            self._bank_id = cwd_bank
+        else:
+            self._bank_id = _resolve_bank_id_template(
+                self._bank_id_template,
+                fallback=cfg.get("bank_id") or banks.get("bankId", "hermes"),
+                profile=self._agent_identity,
+                workspace=self._agent_workspace,
+                platform=self._platform,
+                user=self._user_id,
+                session=self._session_id,
+            )
+        # Multi-bank write/recall (optional, default off): the deduped ordered
+        # set used for write fan-out and prioritized recall merge.
+        self._mirror_to_own_bank = bool(cfg.get("mirror_to_own_bank", False))
+        self._additional_bank_ids = [
+            b.strip() for b in (cfg.get("additional_banks") or []) if isinstance(b, str) and b.strip()
+        ]
+        self._write_bank_ids = self._build_write_bank_ids()
         budget = cfg.get("recall_budget") or cfg.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
         memory_mode = cfg.get("memory_mode", "hybrid")
@@ -1191,18 +1230,33 @@ class HindsightMemoryProvider(MemoryProvider):
         return why is not None
 
     def _recall(self, query: str) -> list:
-        kwargs: dict = {
-            "bank_id": self._bank_id,
-            "query": query,
-            "budget": self._budget,
-            "max_tokens": self._recall_max_tokens,
-        }
-        if self._recall_tags:
-            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
-        if self._recall_types:
-            kwargs["types"] = self._recall_types
-        resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-        return resp.results or []
+        """Semantic recall across the write set (primary bank first, then
+        mirrors/additional banks), deduped by text. Single-bank configs query
+        exactly ``_bank_id`` — identical to the pre-multi-bank behavior."""
+        bank_ids = list(getattr(self, "_write_bank_ids", None) or [self._bank_id])
+        results, seen = [], set()
+        for bank_id in bank_ids:
+            kwargs: dict = {
+                "bank_id": bank_id,
+                "query": query,
+                "budget": self._budget,
+                "max_tokens": self._recall_max_tokens,
+            }
+            if self._recall_tags:
+                kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+            if self._recall_types:
+                kwargs["types"] = self._recall_types
+            try:
+                resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
+            except Exception as exc:
+                logger.debug("Recall: bank %s failed: %s", bank_id, exc)
+                continue
+            for r in (resp.results or []):
+                text = getattr(r, "text", None)
+                if text and text not in seen:
+                    seen.add(text)
+                    results.append(r)
+        return results
 
     def _reflect(self, query: str) -> str | None:
         resp = self._run_hindsight_operation(
@@ -1358,27 +1412,29 @@ class HindsightMemoryProvider(MemoryProvider):
         metadata = self._build_metadata(message_count=len(turns) * 2, turn_index=self._turn_index)
         lineage = (("session", self._session_id), ("parent", self._parent_session_id))
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
-        bank_id, retain_async, retain_context = self._bank_id, self._retain_async, self._retain_context
+        bank_ids = list(getattr(self, "_write_bank_ids", None) or [self._bank_id])
+        retain_async, retain_context = self._retain_async, self._retain_context
 
         def _job() -> None:
             item = self._build_retain_kwargs(
                 content, context=retain_context, metadata=metadata, tags=tags, update_mode=update_mode
             )
-            logger.debug(
-                "Hindsight %s: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
-                label,
-                bank_id,
-                document_id,
-                update_mode,
-                retain_async,
-                len(content),
-                len(turns),
-            )
-            resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
-            # Async retains are only *accepted* here; track the op id(s) so the
-            # next-turn prefetch can wait for true server-side completion.
-            if retain_async and track_ops:
-                self._track_retain_ops(resp, bank_id)
+            for bank_id in bank_ids:
+                logger.debug(
+                    "Hindsight %s: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
+                    label,
+                    bank_id,
+                    document_id,
+                    update_mode,
+                    retain_async,
+                    len(content),
+                    len(turns),
+                )
+                resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
+                # Async retains are only *accepted* here; track the op id(s) so the
+                # next-turn prefetch can wait for true server-side completion.
+                if retain_async and track_ops:
+                    self._track_retain_ops(resp, bank_id)
             logger.debug("Hindsight %s succeeded", label)
 
         return _job
@@ -1466,8 +1522,14 @@ class HindsightMemoryProvider(MemoryProvider):
         item = self._build_retain_kwargs(
             content, context=context, tags=args.get("tags"), occurred_at=args.get("occurred_at")
         )
-        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s", self._bank_id, len(content), context)
-        self._retain_batch(item, bank_id=self._bank_id)
+        for bank_id in list(getattr(self, "_write_bank_ids", None) or [self._bank_id]):
+            logger.debug(
+                "Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
+                bank_id,
+                len(content),
+                context,
+            )
+            self._retain_batch(item, bank_id=bank_id)
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
 
