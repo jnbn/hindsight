@@ -51,13 +51,23 @@ def test_provider_derives_workspace_from_cwd(tmp_path: Path):
     sub.mkdir(parents=True)
 
     provider = HindsightMemoryProvider()
-    with patch.object(plugin, "_load_config", return_value={"bank_id_template": "{workspace}"}):
+    with patch.object(plugin, "_load_config", return_value={"bank_id": "hermes", "bank_id_template": "{workspace}"}):
         provider.initialize(
             session_id="s2",
             cwd=str(sub),
             agent_workspace="hermes",  # upstream default fallback
         )
     assert provider._bank_id == "my-awesome-repo"
+
+    # In user home / root with no project git repo, falls back to default bank
+    provider_home = HindsightMemoryProvider()
+    with patch.object(plugin, "_load_config", return_value={"bank_id": "hermes", "bank_id_template": "{workspace}"}):
+        provider_home.initialize(
+            session_id="s3",
+            cwd=str(Path.home()),
+            agent_workspace="hermes",
+        )
+    assert provider_home._bank_id == "hermes"
 
 
 def test_provider_multibank_write_and_recall_order():

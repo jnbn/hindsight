@@ -171,8 +171,8 @@ def _derive_workspace_from_cwd(start_dir: str | None = None) -> str:
     """Derive the workspace name from *start_dir*.
 
     Walks up to find a git repository root (containing ``.git``), returning its
-    directory name. If not inside a git repository, returns the leaf directory
-    name of *start_dir*. Returns empty string if *start_dir* is empty.
+    directory name. If outside a git repository or at user home directory / root,
+    returns an empty string so the fallback bank (e.g. 'hermes') is used.
     """
     if not start_dir:
         return ""
@@ -180,10 +180,17 @@ def _derive_workspace_from_cwd(start_dir: str | None = None) -> str:
 
     try:
         d = Path(start_dir).resolve()
+        home = Path.home().resolve()
+        # If at user home or root without a git repo, no project workspace
+        if d in {home, Path(d.root)}:
+            return ""
         for folder in (d, *d.parents):
+            if folder in {home, Path(folder.root)}:
+                break
             if (folder / ".git").exists():
                 return folder.name
-        if d.name:
+        # Fallback to directory name only if not home or root
+        if d != home and d.name:
             return d.name
     except Exception as exc:
         logger.debug("hindsight: derive workspace from cwd failed: %s", exc)
