@@ -62,6 +62,7 @@ from .settings import (
     _parse_int_setting,
     _resolve_bank_id_template,
     _discover_cwd_bank_id,
+    _derive_workspace_from_cwd,
 )
 
 logger = logging.getLogger(__name__)
@@ -1049,11 +1050,17 @@ class HindsightMemoryProvider(MemoryProvider):
         if cwd_bank:
             self._bank_id = cwd_bank
         else:
+            # If agent_workspace is not provided or defaulted to "hermes", derive it from cwd.
+            workspace = getattr(self, "_agent_workspace", "")
+            if (not workspace or workspace == "hermes") and getattr(self, "_cwd", None):
+                derived = _derive_workspace_from_cwd(self._cwd)
+                if derived:
+                    workspace = derived
             self._bank_id = _resolve_bank_id_template(
                 self._bank_id_template,
                 fallback=cfg.get("bank_id") or banks.get("bankId", "hermes"),
                 profile=self._agent_identity,
-                workspace=self._agent_workspace,
+                workspace=workspace,
                 platform=self._platform,
                 user=self._user_id,
                 session=self._session_id,

@@ -1,6 +1,6 @@
 """Tests for per-project bank walk-up and multi-bank fan-out."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +42,22 @@ def test_provider_initializes_with_cwd_bank(tmp_path: Path):
         bank_id_template="hermes-{workspace}",
     )
     assert provider._bank_id == "project-x-bank"
+
+
+def test_provider_derives_workspace_from_cwd(tmp_path: Path):
+    git_repo = tmp_path / "my-awesome-repo"
+    (git_repo / ".git").mkdir(parents=True)
+    sub = git_repo / "pkg" / "sub"
+    sub.mkdir(parents=True)
+
+    provider = HindsightMemoryProvider()
+    with patch.object(plugin, "_load_config", return_value={"bank_id_template": "{workspace}"}):
+        provider.initialize(
+            session_id="s2",
+            cwd=str(sub),
+            agent_workspace="hermes",  # upstream default fallback
+        )
+    assert provider._bank_id == "my-awesome-repo"
 
 
 def test_provider_multibank_write_and_recall_order():
