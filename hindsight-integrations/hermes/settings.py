@@ -195,4 +195,3 @@ def _derive_workspace_from_cwd(start_dir: str | None = None) -> str:
     except Exception as exc:
         logger.debug("hindsight: derive workspace from cwd failed: %s", exc)
     return ""
-

@@ -73,11 +73,13 @@ def test_provider_derives_workspace_from_cwd(tmp_path: Path):
 def test_provider_multibank_write_and_recall_order():
     provider = HindsightMemoryProvider()
     provider._config = {"bank_id": "default-bank"}
-    provider._apply_connection_settings({
-        "bank_id": "default-bank",
-        "mirror_to_own_bank": True,
-        "additional_banks": ["shared-knowledge", "global-bank"],
-    })
+    provider._apply_connection_settings(
+        {
+            "bank_id": "default-bank",
+            "mirror_to_own_bank": True,
+            "additional_banks": ["shared-knowledge", "global-bank"],
+        }
+    )
     # Primary is default-bank, mirror is identical, so deduped:
     assert provider._write_bank_ids == ["default-bank", "shared-knowledge", "global-bank"]
 
@@ -95,12 +97,14 @@ def test_provider_recall_dedupes_across_banks():
     # Mock _run_hindsight_operation
     def mock_run(op):
         mock_client = MagicMock()
+
         def arecall(bank_id, **kwargs):
             if bank_id == "primary":
                 return SimpleNamespace(results=[SimpleNamespace(text="Fact 1"), SimpleNamespace(text="Fact 2")])
             elif bank_id == "secondary":
                 return SimpleNamespace(results=[SimpleNamespace(text="Fact 2"), SimpleNamespace(text="Fact 3")])
             return SimpleNamespace(results=[])
+
         mock_client.arecall = arecall
         return op(mock_client)
 
@@ -134,6 +138,8 @@ def test_provider_sync_turn_retains_to_all_write_banks():
 
     assert retained_banks == ["b1", "b2"]
     assert provider._pending_retain_ops == {("b1", "op-b1"), ("b2", "op-b2")}
+
+
 def _provider_with(cfg: dict) -> HindsightMemoryProvider:
     provider = HindsightMemoryProvider()
     provider._config = {"bank_id": cfg.get("bank_id", "hermes")}

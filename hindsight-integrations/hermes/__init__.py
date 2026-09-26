@@ -57,12 +57,12 @@ from .settings import (
     _PROVIDER_DEFAULT_MODELS,
     _VALID_BUDGETS,
     _daemon_llm_provider,
+    _derive_workspace_from_cwd,
+    _discover_cwd_bank_id,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _parse_int_setting,
     _resolve_bank_id_template,
-    _discover_cwd_bank_id,
-    _derive_workspace_from_cwd,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,9 +169,11 @@ def _check_api_supports_update_mode_append(api_url: str, api_key: str | None = N
         return False
     try:
         from agent.credential_persistence import fingerprint_secret_value
+
         key_fp = fingerprint_secret_value(api_key)
     except Exception:
         import hashlib
+
         key_fp = hashlib.sha256((api_key or "").encode()).hexdigest()[:16] if api_key else None
 
     cache_key = (api_url, key_fp)
@@ -1280,7 +1282,7 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as exc:
                 logger.debug("Recall: bank %s failed: %s", bank_id, exc)
                 continue
-            for r in (resp.results or []):
+            for r in resp.results or []:
                 text = getattr(r, "text", None)
                 if text and text not in seen:
                     seen.add(text)
