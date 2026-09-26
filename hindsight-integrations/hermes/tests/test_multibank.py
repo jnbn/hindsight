@@ -359,3 +359,15 @@ def test_retain_tool_reports_failure_when_the_primary_fails():
 
     assert written == ["primary", "shared"]
     assert "Failed to store memory: primary unavailable" in result
+
+
+def test_mirror_uses_the_nested_bank_id_form_like_the_fallback(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config = {"banks": {"hermes": {"bankId": "personal"}}, "bank_id_template": "{project}", "mirror_to_own_bank": True}
+    provider = HindsightMemoryProvider()
+    with patch.object(plugin, "_load_config", return_value=config):
+        provider.initialize(session_id="s1", cwd=str(repo))
+
+    assert provider._bank_id == "repo"
+    assert provider._write_bank_ids == ["repo", "personal"]

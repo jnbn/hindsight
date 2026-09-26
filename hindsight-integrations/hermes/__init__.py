@@ -411,6 +411,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
         self._bank_mission, self._bank_retain_mission = "", None
         self._mirror_to_own_bank = False
+        self._static_bank_id = "hermes"
         self._additional_bank_ids: list[str] = []
         self._recall_additional_bank_ids: list[str] = []
         self._write_bank_ids: list[str] = ["hermes"]
@@ -1031,10 +1032,9 @@ class HindsightMemoryProvider(MemoryProvider):
         and different → each ``additional_banks`` entry. Deduped throughout.
         With no multi-bank config this is exactly ``[_bank_id]``.
         """
-        own = self._config.get("bank_id") if self._config else self._bank_id
         ordered: list[str] = [self._bank_id]
-        if self._mirror_to_own_bank and own and own != self._bank_id:
-            ordered.append(own)
+        if self._mirror_to_own_bank and self._static_bank_id not in ordered:
+            ordered.append(self._static_bank_id)
         for bank in self._additional_bank_ids:
             if bank not in ordered:
                 ordered.append(bank)
@@ -1084,6 +1084,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         banks = cfg_get(cfg, "banks", "hermes", default={})
         self._bank_id_template = cfg.get("bank_id_template", "") or ""
+        # The static bank: the template's fallback and the mirror target, from one place.
+        self._static_bank_id = cfg.get("bank_id") or banks.get("bankId", "hermes")
         # Precedence: closest .hindsight/config.toml in a trusted repository → template → static bank_id.
         cwd_bank = _discover_cwd_bank_id(self._cwd, _normalize_string_list(cfg.get("trusted_project_dirs")))
         if cwd_bank:
@@ -1093,7 +1095,7 @@ class HindsightMemoryProvider(MemoryProvider):
             project = _derive_project_from_cwd(self._cwd) if "{project}" in self._bank_id_template else ""
             self._bank_id = _resolve_bank_id_template(
                 self._bank_id_template,
-                fallback=cfg.get("bank_id") or banks.get("bankId", "hermes"),
+                fallback=self._static_bank_id,
                 profile=self._agent_identity,
                 workspace=self._agent_workspace,
                 project=project,
