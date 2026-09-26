@@ -137,7 +137,7 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
         return fallback
     try:
         rendered = template.format(**{k: _sanitize_bank_segment(v) for k, v in placeholders.items()})
-    except (KeyError, IndexError) as exc:
+    except (KeyError, IndexError, ValueError) as exc:
         logger.warning("Invalid bank_id_template %r: %s — using fallback %r", template, exc, fallback)
         return fallback
     return re.sub(r"([-_])\1+", r"\1", rendered).strip("-_") or fallback
@@ -176,21 +176,23 @@ def _main_repository_root(root: Path) -> Path:
 
 
 def _project_name(root: Path | None) -> str:
-    """Value of the ``{project}`` placeholder: the main repository's folder name (a bare
-    repository drops its ``.git`` suffix), ``""`` when there is no repository."""
+    """Value of the ``{project}`` placeholder: the main repository's folder name, ``""``
+    when there is no repository. Only a bare main repository reached through a worktree
+    drops its ``.git`` suffix; a working tree in a folder named ``x.git`` stays ``x.git``."""
     if root is None:
         return ""
-    return _main_repository_root(root).name.removesuffix(".git")
+    main = _main_repository_root(root)
+    return main.name if main == root else main.name.removesuffix(".git")
 
 
 def _discover_cwd_bank_id(start_dir: str, root: Path | None, trusted_dirs: List[str]) -> str | None:
     """``bank_id`` from the nearest ``.hindsight/config.toml`` inside a trusted repository.
 
     A repository can carry this file to name its bank, but a cloned repository is not
-    trusted by default: the file is read only when the main repository behind *root* (the
-    same one ``{project}`` names, so a worktree follows its main checkout) lies inside one
-    of *trusted_dirs*. Relative entries are ignored, since they would resolve against
-    whatever directory Hermes was started from. The walk goes from *start_dir* up to
+    trusted by default: the file is read only when *root* itself lies inside one of
+    *trusted_dirs*. A linked worktree is judged by its own location, since the files that
+    link it to a main repository are under its own control. Relative entries are ignored,
+    since they would resolve against whatever directory Hermes was started from. The walk goes from *start_dir* up to
     *root* and never above it. Only ``bank_id`` is read, with stdlib ``tomllib``. Never
     raises: an unreadable or malformed file logs a warning and the walk continues.
     """
@@ -207,9 +209,10 @@ def _discover_cwd_bank_id(start_dir: str, root: Path | None, trusted_dirs: List[
                 trusted.append(path.resolve())
             else:
                 logger.warning("hindsight: ignoring relative trusted_project_dirs entry %r", entry)
-        main = _main_repository_root(root)
-        if not any(main == t or t in main.parents for t in trusted):
-            logger.debug("hindsight: %s is not under trusted_project_dirs — ignoring its config", main)
+        # Trust follows where the repository physically is. A worktree's .git file and
+        # commondir are plain files the folder itself controls, so they cannot vouch for it.
+        if not any(root == t or t in root.parents for t in trusted):
+            logger.debug("hindsight: %s is not under trusted_project_dirs — ignoring its config", root)
             return None
         start = Path(start_dir).resolve()
         for folder in (start, *start.parents):

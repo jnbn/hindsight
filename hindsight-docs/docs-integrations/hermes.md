@@ -218,9 +218,9 @@ The primary bank is chosen in this order: a `.hindsight/config.toml` in a truste
 
 The three list settings take a JSON list or comma-separated text; use the JSON form for a value that contains a comma.
 
-A failing extra bank is skipped, for recall and for writes alike, with a warning the first time it fails. An extra bank that has not answered after 80% of `timeout` is skipped, so it never costs the primary its results. A failing primary bank fails the call exactly as it does with a single bank, and a write stops there, before any extra bank is touched.
+A failing extra bank is skipped for five minutes, for recall and for writes alike, with one warning when it goes down and one info line when it answers again; it misses the writes made during that time. An extra bank that has not answered after 80% of `timeout` counts as failing, so it never costs the primary its results. A failing primary bank fails the call exactly as it does with a single bank, and a write stops there, before any extra bank is touched.
 
-A repository inside one of the `trusted_project_dirs` (a worktree counts as its main repository) can name its bank in `.hindsight/config.toml` at its root or in any folder below it:
+A repository that is itself inside one of the `trusted_project_dirs` (a linked worktree is judged by where the worktree is) can name its bank in `.hindsight/config.toml` at its root or in any folder below it:
 
 ```toml
 bank_id = "acme-billing"

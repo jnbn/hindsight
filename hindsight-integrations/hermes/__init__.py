@@ -73,6 +73,9 @@ _LOCAL_MODES = {"local", "local_embedded"}
 # Share of the operation timeout an extra recall bank may use, so a slow extra bank
 # always gives up before the operation that also carries the primary's result does.
 _EXTRA_BANK_TIMEOUT_SHARE = 0.8
+# How long an extra bank is skipped after it fails, for recall and writes alike, so an
+# unreachable bank costs one timeout per cooldown instead of one on every turn.
+_EXTRA_BANK_COOLDOWN = 300.0
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
@@ -410,7 +413,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._mirror_to_own_bank = False
         self._static_bank_id = "hermes"
         self._project, self._bank_source = "", "bank_id"
-        self._failed_extra_banks: set[str] = set()
+        self._extra_bank_down_until: dict[str, float] = {}
         self._additional_bank_ids: list[str] = []
         self._recall_additional_bank_ids: list[str] = []
         self._write_bank_ids: list[str] = ["hermes"]
@@ -1046,21 +1049,36 @@ class HindsightMemoryProvider(MemoryProvider):
 
         A failing primary raises straight away, before any extra bank is touched, so a
         failed retain is reported exactly as on the single-bank path and a retry cannot
-        duplicate the item in the extra banks. A failing extra bank is logged and skipped.
+        duplicate the item in the extra banks. A failing extra bank is logged and skipped,
+        then left out for the cooldown; it misses the writes made during that time.
         """
         write(bank_ids[0])
         for bank_id in bank_ids[1:]:
+            if not self._extra_bank_available(bank_id):
+                continue
             try:
                 write(bank_id)
             except Exception as exc:
                 self._log_bank_failure(label, bank_id, exc)
+            else:
+                self._mark_bank_ok(bank_id)
 
-    def _log_bank_failure(self, label: str, bank_id: str, exc: Exception) -> None:
-        """Warn the first time an extra bank fails, then log at debug level, so a bank
-        that is permanently misconfigured does not print a warning on every turn."""
-        level = logging.DEBUG if bank_id in self._failed_extra_banks else logging.WARNING
-        self._failed_extra_banks.add(bank_id)
-        logger.log(level, "Hindsight %s: skipping bank %s: %s", label, bank_id, exc)
+    def _extra_bank_available(self, bank_id: str) -> bool:
+        """False while an extra bank is cooling down after a failure."""
+        return time.monotonic() >= self._extra_bank_down_until.get(bank_id, 0.0)
+
+    def _log_bank_failure(self, label: str, bank_id: str, exc: BaseException) -> None:
+        """Start a cooldown for a failing extra bank, warning once per outage."""
+        if bank_id not in self._extra_bank_down_until:
+            logger.warning("Hindsight %s: skipping bank %s for %.0fs: %s", label, bank_id, _EXTRA_BANK_COOLDOWN, exc)
+        else:
+            logger.debug("Hindsight %s: bank %s still failing: %s", label, bank_id, exc)
+        self._extra_bank_down_until[bank_id] = time.monotonic() + _EXTRA_BANK_COOLDOWN
+
+    def _mark_bank_ok(self, bank_id: str) -> None:
+        """End an extra bank's outage on its first success."""
+        if self._extra_bank_down_until.pop(bank_id, None) is not None:
+            logger.info("Hindsight: bank %s is answering again", bank_id)
 
     def _build_recall_bank_ids(self) -> list[str]:
         """The banks recall searches: the write set (primary first), then each
@@ -1092,9 +1110,17 @@ class HindsightMemoryProvider(MemoryProvider):
         # The repository is only looked up when something needs it, and only once.
         trusted_dirs = _normalize_string_list(cfg.get("trusted_project_dirs"))
         uses_project = "project" in _template_fields(self._bank_id_template)
-        root = _repository_root(self._cwd) if self._cwd and (trusted_dirs or uses_project) else None
-        self._project = _project_name(root) if uses_project else ""
-        cwd_bank = _discover_cwd_bank_id(self._cwd, root, trusted_dirs)
+        root, cwd_bank, self._project = None, None, ""
+        if self._cwd and (trusted_dirs or uses_project):
+            try:
+                root = _repository_root(self._cwd)
+                self._project = _project_name(root) if uses_project else ""
+                cwd_bank = _discover_cwd_bank_id(self._cwd, root, trusted_dirs)
+            except Exception as exc:
+                logger.warning(
+                    "hindsight: repository lookup for %s failed (%s) — using the static bank", self._cwd, exc
+                )
+                self._project, cwd_bank = "", None
         if cwd_bank:
             self._bank_id, self._bank_source = cwd_bank, "repository config"
         else:
@@ -1293,7 +1319,11 @@ class HindsightMemoryProvider(MemoryProvider):
         single-bank recall does; a failing extra bank is skipped with a warning.
         Single-bank configs query exactly ``_bank_id``.
         """
-        bank_ids = self._build_recall_bank_ids()
+        bank_ids = [
+            bank_id
+            for i, bank_id in enumerate(self._build_recall_bank_ids())
+            if i == 0 or self._extra_bank_available(bank_id)
+        ]
         kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         if self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
@@ -1322,6 +1352,8 @@ class HindsightMemoryProvider(MemoryProvider):
             if isinstance(resp, BaseException):
                 self._log_bank_failure("recall", bank_id, resp)
                 continue
+            if bank_id != bank_ids[0]:
+                self._mark_bank_ok(bank_id)
             for r in resp.results or []:
                 text = getattr(r, "text", None)
                 if text and text not in seen:

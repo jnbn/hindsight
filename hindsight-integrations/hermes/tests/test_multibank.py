@@ -383,34 +383,6 @@ def test_mirror_uses_the_nested_bank_id_form_like_the_fallback(tmp_path: Path):
     assert provider._write_bank_ids == ["repo", "personal"]
 
 
-def test_a_hung_extra_bank_cannot_cost_the_primary_its_results():
-    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["slow"]})
-    provider._timeout = 0.5
-
-    class _Client:
-        async def arecall(self, bank_id, **kwargs):
-            if bank_id == "slow":
-                await asyncio.sleep(5)
-            return SimpleNamespace(results=[SimpleNamespace(text=f"from {bank_id}")])
-
-    provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
-    assert [r.text for r in provider._recall("q")] == ["from primary"]
-
-
-def test_worktree_trust_follows_the_main_repository(tmp_path: Path):
-    main = tmp_path / "work" / "app"
-    worktree_git = main / ".git" / "worktrees" / "wt"
-    worktree_git.mkdir(parents=True)
-    (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
-    worktree = tmp_path / "elsewhere" / "app-wt"
-    (worktree / ".hindsight").mkdir(parents=True)
-    (worktree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
-    (worktree / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n', encoding="utf-8")
-
-    assert _discover(worktree, [str(tmp_path / "work")]) == "acme"
-    assert _discover(worktree, [str(tmp_path / "elsewhere")]) is None
-
-
 def test_relative_trusted_folders_are_ignored(tmp_path: Path, monkeypatch):
     sub = _repo_with_config(tmp_path / "cloned", "attacker-bank")
     monkeypatch.chdir(tmp_path)
@@ -433,16 +405,104 @@ def test_empty_nested_bank_id_never_puts_an_empty_bank_in_the_write_set(tmp_path
     assert provider._write_bank_ids == ["repo", "hermes"]
 
 
-def test_a_failing_extra_bank_warns_once(caplog):
-    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
-    _fake_recall(provider, {"primary": ["from primary"], "vault": RuntimeError("vault down")})
-    with caplog.at_level(logging.DEBUG):
-        provider._recall("q")
-        provider._recall("q")
-    warnings = [r for r in caplog.records if "skipping bank vault" in r.getMessage()]
-    assert [r.levelno for r in warnings] == [logging.WARNING, logging.DEBUG]
-
-
 def test_bracketed_text_that_is_not_json_is_read_as_a_list():
     assert _normalize_string_list("[team, vault]") == ["team", "vault"]
     assert _normalize_string_list("['team', \"vault\"]") == ["team", "vault"]
+
+
+def test_a_hung_extra_bank_cannot_cost_the_primary_its_results():
+    """Runs through the real _run_sync deadline, so it fails if the extra bank's own
+    deadline were ever allowed past the operation's."""
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["slow"]})
+    provider._timeout = 1
+
+    class _Client:
+        async def arecall(self, bank_id, **kwargs):
+            if bank_id == "slow":
+                await asyncio.sleep(5)
+            return SimpleNamespace(results=[SimpleNamespace(text=f"from {bank_id}")])
+
+    provider._get_client = lambda: _Client()
+    assert [r.text for r in provider._recall("q")] == ["from primary"]
+
+
+def _worktree(tmp_path: Path, main_parent: str, worktree_parent: str) -> Path:
+    worktree_git = tmp_path / main_parent / "app" / ".git" / "worktrees" / "wt"
+    worktree_git.mkdir(parents=True)
+    (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = tmp_path / worktree_parent / "app-wt"
+    (worktree / ".hindsight").mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+    (worktree / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n', encoding="utf-8")
+    return worktree
+
+
+def test_worktree_trust_is_decided_by_its_own_location(tmp_path: Path):
+    worktree = _worktree(tmp_path, "work", "elsewhere")
+    assert _discover(worktree, [str(tmp_path / "work")]) is None
+    assert _discover(worktree, [str(tmp_path / "elsewhere")]) == "acme"
+    assert _bank_for(str(worktree), "{project}") == "app"
+
+
+def test_a_forged_commondir_cannot_claim_a_trusted_location(tmp_path: Path):
+    folder = tmp_path / "downloads" / "tarball"
+    fake = folder / "fake"
+    fake.mkdir(parents=True)
+    (fake / "commondir").write_text(str(tmp_path / "work" / "anything" / ".git") + "\n", encoding="utf-8")
+    (folder / ".git").write_text("gitdir: fake\n", encoding="utf-8")
+    (folder / ".hindsight").mkdir()
+    (folder / ".hindsight" / "config.toml").write_text('bank_id = "attacker"\n', encoding="utf-8")
+
+    assert _discover(folder, [str(tmp_path / "work")]) is None
+
+
+def test_a_failing_extra_bank_is_skipped_for_the_cooldown_and_warns_once(caplog):
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
+    answers = {"primary": ["from primary"], "vault": RuntimeError("vault down")}
+    queried = []
+    _fake_recall(provider, answers, queried)
+
+    with caplog.at_level(logging.DEBUG):
+        provider._recall("q")
+        provider._recall("q")
+    assert queried == ["primary", "vault", "primary"]
+    assert [r.levelno for r in caplog.records if "skipping bank vault" in r.getMessage()] == [logging.WARNING]
+
+    # Cooldown over and the bank answers again: it is queried and the outage ends.
+    provider._extra_bank_down_until["vault"] = 0.0
+    answers["vault"] = ["from vault"]
+    with caplog.at_level(logging.INFO):
+        texts = [r.text for r in provider._recall("q")]
+    assert texts == ["from primary", "from vault"]
+    assert "vault" not in provider._extra_bank_down_until
+    assert "bank vault is answering again" in caplog.text
+
+
+def test_writes_skip_an_extra_bank_while_it_cools_down():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": ["broken", "shared"]})
+    written = _fake_retain(provider, failing={"broken"})
+
+    provider.handle_tool_call("hindsight_retain", {"content": "one"})
+    provider.handle_tool_call("hindsight_retain", {"content": "two"})
+
+    assert written == ["primary", "broken", "shared", "primary", "shared"]
+
+
+def test_a_malformed_template_falls_back_instead_of_crashing(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    assert _bank_for(str(repo), "hermes-{project") == "hermes"
+    assert _bank_for(str(repo), "{project:d}") == "hermes"
+
+
+def test_an_unreadable_git_file_falls_back_to_the_static_bank(tmp_path: Path):
+    folder = tmp_path / "broken"
+    folder.mkdir()
+    (folder / ".git").write_bytes(b"\xff\xfe not utf-8")
+    assert _bank_for(str(folder), "{project}") == "hermes"
+
+
+def test_a_working_tree_named_like_a_bare_repository_keeps_its_name(tmp_path: Path):
+    repo = tmp_path / "mirror.git"
+    (repo / ".git").mkdir(parents=True)
+    assert _bank_for(str(repo), "{project}") == "mirror-git"
