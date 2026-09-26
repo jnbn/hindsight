@@ -1262,25 +1262,33 @@ class HindsightMemoryProvider(MemoryProvider):
     def _recall(self, query: str) -> list:
         """Semantic recall across the write set (primary bank first, then
         mirrors/additional banks), then any recall-only banks, deduped by text.
-        Single-bank configs query exactly ``_bank_id`` — identical to the
-        pre-multi-bank behavior."""
+
+        All banks are queried concurrently, each with the configured budget and
+        ``recall_max_tokens``. A primary-bank failure raises, exactly as the
+        single-bank recall does; a failing extra bank is skipped with a warning.
+        Single-bank configs query exactly ``_bank_id``.
+        """
         bank_ids = self._build_recall_bank_ids()
+        kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
+        if self._recall_tags:
+            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+        if self._recall_types:
+            kwargs["types"] = self._recall_types
+
+        async def _recall_all(client):
+            responses = await asyncio.gather(
+                *(client.arecall(bank_id=bank_id, **kwargs) for bank_id in bank_ids), return_exceptions=True
+            )
+            # Raising keeps the primary's single-bank contract and lets
+            # _run_hindsight_operation retry a stale embedded daemon.
+            if isinstance(responses[0], BaseException):
+                raise responses[0]
+            return responses
+
         results, seen = [], set()
-        for bank_id in bank_ids:
-            kwargs: dict = {
-                "bank_id": bank_id,
-                "query": query,
-                "budget": self._budget,
-                "max_tokens": self._recall_max_tokens,
-            }
-            if self._recall_tags:
-                kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
-            if self._recall_types:
-                kwargs["types"] = self._recall_types
-            try:
-                resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-            except Exception as exc:
-                logger.debug("Recall: bank %s failed: %s", bank_id, exc)
+        for bank_id, resp in zip(bank_ids, self._run_hindsight_operation(_recall_all)):
+            if isinstance(resp, BaseException):
+                logger.warning("Recall: skipping bank %s: %s", bank_id, resp)
                 continue
             for r in resp.results or []:
                 text = getattr(r, "text", None)

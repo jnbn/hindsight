@@ -1,13 +1,33 @@
 """Tests for per-project bank walk-up and multi-bank fan-out."""
 
+import asyncio
+import logging
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import hindsight_hermes as plugin
 from hindsight_hermes.settings import _discover_cwd_bank_id
 
 HindsightMemoryProvider = plugin.HindsightMemoryProvider
+
+
+def _fake_recall(provider, answers: dict, queried: list | None = None) -> None:
+    """Route the provider's recall to *answers*: bank id -> list of texts, or an
+    exception to raise for that bank. Runs the real async operation."""
+
+    class _Client:
+        async def arecall(self, bank_id, **kwargs):
+            if queried is not None:
+                queried.append(bank_id)
+            answer = answers.get(bank_id, [])
+            if isinstance(answer, Exception):
+                raise answer
+            return SimpleNamespace(results=[SimpleNamespace(text=t) for t in answer])
+
+    provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
 
 
 def test_discover_cwd_bank_id_finds_root(tmp_path: Path):
@@ -93,22 +113,7 @@ def test_provider_recall_dedupes_across_banks():
     provider = HindsightMemoryProvider()
     provider._bank_id = "primary"
     provider._write_bank_ids = ["primary", "secondary"]
-
-    # Mock _run_hindsight_operation
-    def mock_run(op):
-        mock_client = MagicMock()
-
-        def arecall(bank_id, **kwargs):
-            if bank_id == "primary":
-                return SimpleNamespace(results=[SimpleNamespace(text="Fact 1"), SimpleNamespace(text="Fact 2")])
-            elif bank_id == "secondary":
-                return SimpleNamespace(results=[SimpleNamespace(text="Fact 2"), SimpleNamespace(text="Fact 3")])
-            return SimpleNamespace(results=[])
-
-        mock_client.arecall = arecall
-        return op(mock_client)
-
-    provider._run_hindsight_operation = mock_run
+    _fake_recall(provider, {"primary": ["Fact 1", "Fact 2"], "secondary": ["Fact 2", "Fact 3"]})
 
     results = provider._recall("test query")
     texts = [r.text for r in results]
@@ -180,18 +185,7 @@ def test_bank_in_both_lists_stays_writable_and_is_recalled_once():
 def test_recall_queries_recall_only_banks_last():
     provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
     queried = []
-
-    def mock_run(op):
-        mock_client = MagicMock()
-
-        def arecall(bank_id, **kwargs):
-            queried.append(bank_id)
-            return SimpleNamespace(results=[SimpleNamespace(text=f"fact from {bank_id}")])
-
-        mock_client.arecall = arecall
-        return op(mock_client)
-
-    provider._run_hindsight_operation = mock_run
+    _fake_recall(provider, {"primary": ["fact from primary"], "vault": ["fact from vault"]}, queried)
     texts = [r.text for r in provider._recall("query")]
     assert queried == ["primary", "vault"]
     assert texts == ["fact from primary", "fact from vault"]
@@ -242,3 +236,31 @@ def test_empty_bank_list_text_means_no_extra_banks():
     provider = _provider_with({"bank_id": "primary", "additional_banks": "", "recall_additional_banks": " , "})
     assert provider._write_bank_ids == ["primary"]
     assert provider._build_recall_bank_ids() == ["primary"]
+
+
+def test_recall_skips_a_failing_extra_bank_with_a_warning(caplog):
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault", "notes"]})
+    _fake_recall(provider, {"primary": ["from primary"], "vault": RuntimeError("vault down"), "notes": ["from notes"]})
+
+    with caplog.at_level(logging.WARNING):
+        texts = [r.text for r in provider._recall("query")]
+
+    assert texts == ["from primary", "from notes"]
+    assert "skipping bank vault" in caplog.text
+
+
+def test_recall_raises_when_the_primary_bank_fails():
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
+    _fake_recall(provider, {"primary": RuntimeError("401 Unauthorized"), "vault": ["from vault"]})
+
+    with pytest.raises(RuntimeError, match="401"):
+        provider._recall("query")
+
+
+def test_single_bank_recall_error_reaches_the_tool_as_a_failure():
+    provider = _provider_with({"bank_id": "primary"})
+    _fake_recall(provider, {"primary": RuntimeError("connection refused")})
+
+    result = provider.handle_tool_call("hindsight_recall", {"query": "q"})
+    assert "Failed to search memory: connection refused" in result
+    assert "No relevant memories found" not in result
