@@ -168,16 +168,9 @@ def _check_api_supports_update_mode_append(api_url: str, api_key: str | None = N
     """
     if not api_url:
         return False
-    try:
-        from agent.credential_persistence import fingerprint_secret_value
+    from agent.credential_persistence import fingerprint_secret_value
 
-        key_fp = fingerprint_secret_value(api_key)
-    except Exception:
-        import hashlib
-
-        key_fp = hashlib.sha256((api_key or "").encode()).hexdigest()[:16] if api_key else None
-
-    cache_key = (api_url, key_fp)
+    cache_key = (api_url, fingerprint_secret_value(api_key))
     with _append_capability_lock:
         if cache_key in _append_capability_cache:
             return _append_capability_cache[cache_key]
@@ -447,7 +440,6 @@ class HindsightMemoryProvider(MemoryProvider):
         # get_operation_status (a drained local queue is not a read-after-write signal).
         self._pending_retain_ops: set[tuple[str, str]] = set()
         self._pending_retain_ops_lock = threading.Lock()
-        self._retain_ops_bank_id = ""
         self._apply_retain_policy({})
 
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
@@ -1069,8 +1061,8 @@ class HindsightMemoryProvider(MemoryProvider):
         listed in both ``additional_banks`` and ``recall_additional_banks`` stays
         writable. With no recall-only banks this is exactly the write set.
         """
-        ordered = list(getattr(self, "_write_bank_ids", None) or [self._bank_id])
-        for bank in getattr(self, "_recall_additional_bank_ids", None) or []:
+        ordered = list(self._write_bank_ids)
+        for bank in self._recall_additional_bank_ids:
             if bank not in ordered:
                 ordered.append(bank)
         return ordered
@@ -1470,7 +1462,7 @@ class HindsightMemoryProvider(MemoryProvider):
         metadata = self._build_metadata(message_count=len(turns) * 2, turn_index=self._turn_index)
         lineage = (("session", self._session_id), ("parent", self._parent_session_id))
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
-        bank_ids = list(getattr(self, "_write_bank_ids", None) or [self._bank_id])
+        bank_ids = list(self._write_bank_ids)
         retain_async, retain_context = self._retain_async, self._retain_context
 
         def _job() -> None:
@@ -1593,9 +1585,7 @@ class HindsightMemoryProvider(MemoryProvider):
             )
             self._retain_batch(item, bank_id=bank_id)
 
-        self._write_to_banks(
-            list(getattr(self, "_write_bank_ids", None) or [self._bank_id]), _write, label="tool retain"
-        )
+        self._write_to_banks(list(self._write_bank_ids), _write, label="tool retain")
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
 

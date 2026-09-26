@@ -14,6 +14,12 @@ from hindsight_hermes.settings import _discover_cwd_bank_id
 HindsightMemoryProvider = plugin.HindsightMemoryProvider
 
 
+@pytest.fixture(autouse=True)
+def _pin_update_mode_probe(monkeypatch):
+    # The /version probe is a live HTTP call; pin the capability, as conftest's provider fixture does.
+    monkeypatch.setattr(plugin, "_check_api_supports_update_mode_append", lambda *a, **k: True)
+
+
 def _fake_recall(provider, answers: dict, queried: list | None = None) -> None:
     """Route the provider's recall to *answers*: bank id -> list of texts, or an
     exception to raise for that bank. Runs the real async operation."""
