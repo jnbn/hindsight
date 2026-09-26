@@ -143,37 +143,60 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
     return re.sub(r"([-_])\1+", r"\1", rendered).strip("-_") or fallback
 
 
-def _discover_cwd_bank_id(start_dir: str | None = None) -> str | None:
-    """Walk up from *start_dir* to the filesystem root, returning the first
-    ``.hindsight/config.toml`` found.
+def _discover_cwd_bank_id(start_dir: str | None = None, trusted_dirs: List[str] | None = None) -> str | None:
+    """``bank_id`` from the nearest ``.hindsight/config.toml`` inside a trusted repository.
 
-    Reads only the ``bank_id`` key, parsed with stdlib ``tomllib``. Never raises:
-    an unreadable or malformed file logs a warning and the walk continues.
-    Returns ``None`` when nothing found.
+    A repository can carry this file to name its bank, but a cloned repository is not
+    trusted by default: the file is read only when the repository root lies inside one of
+    *trusted_dirs* (``trusted_project_dirs`` in the config). The walk goes from *start_dir*
+    up to the repository root and never above it, so a file in the home directory or any
+    parent folder is never picked up. Only ``bank_id`` is read, with stdlib ``tomllib``.
+    Never raises: an unreadable or malformed file logs a warning and the walk continues.
+    Returns ``None`` when nothing applies.
     """
-    if not start_dir:
+    if not start_dir or not trusted_dirs:
         return None
 
     import tomllib
 
     try:
-        d = Path(start_dir).resolve()
-        for folder in (d, *d.parents):
+        root = _repository_root(start_dir)
+        if root is None:
+            return None
+        trusted = [Path(d).expanduser().resolve() for d in trusted_dirs]
+        if not any(root == t or t in root.parents for t in trusted):
+            logger.debug("hindsight: %s is not under trusted_project_dirs — ignoring its config", root)
+            return None
+        start = Path(start_dir).resolve()
+        for folder in (start, *start.parents):
             candidate = folder / ".hindsight" / "config.toml"
-            if not candidate.is_file():
-                continue
-            try:
-                data = tomllib.loads(candidate.read_text(encoding="utf-8", errors="replace"))
-                bank = data.get("bank_id")
-                if isinstance(bank, str) and bank.strip():
-                    return bank.strip()
-                logger.warning("hindsight: %s has no usable bank_id — walking up", candidate)
-                continue
-            except Exception as exc:
-                logger.warning("hindsight: cannot read %s (%s) — walking up", candidate, exc)
-                continue
+            if candidate.is_file():
+                try:
+                    data = tomllib.loads(candidate.read_text(encoding="utf-8", errors="replace"))
+                    bank = data.get("bank_id")
+                    if isinstance(bank, str) and bank.strip():
+                        return bank.strip()
+                    logger.warning("hindsight: %s has no usable bank_id — walking up", candidate)
+                except Exception as exc:
+                    logger.warning("hindsight: cannot read %s (%s) — walking up", candidate, exc)
+            if folder == root:
+                break
     except Exception as exc:
         logger.debug("hindsight: cwd walk failed: %s", exc)
+    return None
+
+
+def _repository_root(start_dir: str) -> Path | None:
+    """The nearest folder at or above *start_dir* holding ``.git`` (a directory, or a
+    worktree's ``.git`` file). ``None`` outside a repository, and for a repository rooted
+    at the home directory or the filesystem root."""
+    start = Path(start_dir).resolve()
+    home = Path.home().resolve()
+    for folder in (start, *start.parents):
+        if folder in {home, Path(folder.root)}:
+            return None
+        if (folder / ".git").exists():
+            return folder
     return None
 
 
@@ -188,16 +211,13 @@ def _derive_project_from_cwd(start_dir: str | None = None) -> str:
     if not start_dir:
         return ""
     try:
-        start = Path(start_dir).resolve()
-        home = Path.home().resolve()
-        for folder in (start, *start.parents):
-            if folder in {home, Path(folder.root)}:
-                return ""
-            marker = folder / ".git"
-            if marker.is_dir():
-                return folder.name
-            if marker.is_file():
-                return _main_repository_name(marker) or folder.name
+        root = _repository_root(start_dir)
+        if root is None:
+            return ""
+        marker = root / ".git"
+        if marker.is_file():
+            return _main_repository_name(marker) or root.name
+        return root.name
     except Exception as exc:
         logger.debug("hindsight: derive project from cwd failed: %s", exc)
     return ""

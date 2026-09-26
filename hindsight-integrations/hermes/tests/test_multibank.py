@@ -30,37 +30,54 @@ def _fake_recall(provider, answers: dict, queried: list | None = None) -> None:
     provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
 
 
-def test_discover_cwd_bank_id_finds_root(tmp_path: Path):
-    project_root = tmp_path / "my_project"
-    sub_dir = project_root / "src" / "deep"
-    sub_dir.mkdir(parents=True)
-
-    hindsight_dir = project_root / ".hindsight"
-    hindsight_dir.mkdir()
-    (hindsight_dir / "config.toml").write_text('bank_id = "project-bank-alpha"\n', encoding="utf-8")
-
-    assert _discover_cwd_bank_id(str(sub_dir)) == "project-bank-alpha"
+def _repo_with_config(root: Path, bank: str) -> Path:
+    (root / ".git").mkdir(parents=True)
+    (root / ".hindsight").mkdir()
+    (root / ".hindsight" / "config.toml").write_text(f'bank_id = "{bank}"\n', encoding="utf-8")
+    sub = root / "src" / "deep"
+    sub.mkdir(parents=True)
+    return sub
 
 
-def test_discover_cwd_bank_id_returns_none_when_absent(tmp_path: Path):
-    sub_dir = tmp_path / "no_hindsight" / "sub"
-    sub_dir.mkdir(parents=True)
-    assert _discover_cwd_bank_id(str(sub_dir)) is None
+def test_trusted_repository_config_sets_the_bank(tmp_path: Path):
+    sub = _repo_with_config(tmp_path / "work" / "my_project", "project-bank-alpha")
+    assert _discover_cwd_bank_id(str(sub), [str(tmp_path / "work")]) == "project-bank-alpha"
 
 
-def test_provider_initializes_with_cwd_bank(tmp_path: Path):
-    project_root = tmp_path / "project_x"
-    project_root.mkdir()
-    hindsight_dir = project_root / ".hindsight"
-    hindsight_dir.mkdir()
-    (hindsight_dir / "config.toml").write_text('bank_id = "project-x-bank"\n', encoding="utf-8")
+def test_repository_config_is_ignored_unless_its_folder_is_trusted(tmp_path: Path):
+    sub = _repo_with_config(tmp_path / "downloads" / "cloned", "attacker-bank")
+    assert _discover_cwd_bank_id(str(sub), []) is None
+    assert _discover_cwd_bank_id(str(sub), [str(tmp_path / "work")]) is None
 
+
+def test_repository_config_is_never_read_above_the_repository_root(tmp_path: Path):
+    outer = tmp_path / "work"
+    (outer / ".hindsight").mkdir(parents=True)
+    (outer / ".hindsight" / "config.toml").write_text('bank_id = "outer"\n', encoding="utf-8")
+    repo = outer / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    assert _discover_cwd_bank_id(str(repo), [str(outer)]) is None
+
+
+def test_repository_config_outside_a_repository_is_ignored(tmp_path: Path):
+    folder = tmp_path / "work" / "notes"
+    (folder / ".hindsight").mkdir(parents=True)
+    (folder / ".hindsight" / "config.toml").write_text('bank_id = "notes"\n', encoding="utf-8")
+
+    assert _discover_cwd_bank_id(str(folder), [str(tmp_path / "work")]) is None
+
+
+def test_provider_uses_trusted_repository_config_over_the_template(tmp_path: Path):
+    sub = _repo_with_config(tmp_path / "work" / "project_x", "project-x-bank")
+    config = {
+        "bank_id": "hermes",
+        "bank_id_template": "hermes-{project}",
+        "trusted_project_dirs": str(tmp_path / "work"),
+    }
     provider = HindsightMemoryProvider()
-    provider.initialize(
-        session_id="s1",
-        cwd=str(project_root),
-        bank_id_template="hermes-{workspace}",
-    )
+    with patch.object(plugin, "_load_config", return_value=config):
+        provider.initialize(session_id="s1", cwd=str(sub))
     assert provider._bank_id == "project-x-bank"
 
 

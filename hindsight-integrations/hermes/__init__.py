@@ -1084,8 +1084,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         banks = cfg_get(cfg, "banks", "hermes", default={})
         self._bank_id_template = cfg.get("bank_id_template", "") or ""
-        # Precedence: closest .hindsight/config.toml → template → static bank_id.
-        cwd_bank = _discover_cwd_bank_id(self._cwd) if getattr(self, "_cwd", None) else None
+        # Precedence: closest .hindsight/config.toml in a trusted repository → template → static bank_id.
+        cwd_bank = _discover_cwd_bank_id(self._cwd, _normalize_string_list(cfg.get("trusted_project_dirs")))
         if cwd_bank:
             self._bank_id = cwd_bank
         else:

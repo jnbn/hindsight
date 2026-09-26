@@ -73,6 +73,14 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Extra Hindsight banks to recall from but never write to, searched after the write banks (comma-separated). A bank also in Additional banks stays writable.",
         ),
         ProviderField(
+            key="trusted_project_dirs",
+            label="Trusted project folders",
+            kind=KIND_TEXT,
+            default="",
+            inline=True,
+            description="Folders whose git repositories may choose their own bank with a .hindsight/config.toml (comma-separated). Empty = repository config files are ignored.",
+        ),
+        ProviderField(
             key="recall_budget",
             label="Recall budget",
             kind=KIND_SELECT,
