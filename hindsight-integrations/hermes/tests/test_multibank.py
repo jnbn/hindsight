@@ -414,12 +414,12 @@ def test_a_hung_extra_bank_cannot_cost_the_primary_its_results():
     """Runs through the real _run_sync deadline, so it fails if the extra bank's own
     deadline were ever allowed past the operation's."""
     provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["slow"]})
-    provider._timeout = 1
+    provider._timeout = 5
 
     class _Client:
         async def arecall(self, bank_id, **kwargs):
             if bank_id == "slow":
-                await asyncio.sleep(5)
+                await asyncio.sleep(30)
             return SimpleNamespace(results=[SimpleNamespace(text=f"from {bank_id}")])
 
     provider._get_client = lambda: _Client()
@@ -469,12 +469,12 @@ def test_a_failing_extra_bank_is_skipped_for_the_cooldown_and_warns_once(caplog)
     assert [r.levelno for r in caplog.records if "skipping bank vault" in r.getMessage()] == [logging.WARNING]
 
     # Cooldown over and the bank answers again: it is queried and the outage ends.
-    provider._extra_bank_down_until["vault"] = 0.0
+    provider._extra_bank_down_until[("recall", "vault")] = 0.0
     answers["vault"] = ["from vault"]
     with caplog.at_level(logging.INFO):
         texts = [r.text for r in provider._recall("q")]
     assert texts == ["from primary", "from vault"]
-    assert "vault" not in provider._extra_bank_down_until
+    assert ("recall", "vault") not in provider._extra_bank_down_until
     assert "bank vault is answering again" in caplog.text
 
 
@@ -506,3 +506,50 @@ def test_a_working_tree_named_like_a_bare_repository_keeps_its_name(tmp_path: Pa
     repo = tmp_path / "mirror.git"
     (repo / ".git").mkdir(parents=True)
     assert _bank_for(str(repo), "{project}") == "mirror-git"
+
+
+def test_attribute_and_index_templates_fall_back_instead_of_crashing(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    assert _bank_for(str(repo), "{project.name}") == "hermes"
+    assert _bank_for(str(repo), "{project[a]}") == "hermes"
+
+
+def test_worktrees_of_a_checkout_named_like_a_bare_repository_share_its_name(tmp_path: Path):
+    main = tmp_path / "app.git"
+    worktree_git = main / ".git" / "worktrees" / "wt"
+    worktree_git.mkdir(parents=True)
+    (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+
+    assert _bank_for(str(main), "{project}") == "app-git"
+    assert _bank_for(str(worktree), "{project}") == "app-git"
+
+
+def test_a_failed_recall_does_not_stop_writes_to_the_same_bank():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": ["team"]})
+    _fake_recall(provider, {"primary": ["from primary"], "team": RuntimeError("slow search")})
+    provider._recall("q")
+    written = _fake_retain(provider, failing=set())
+
+    provider.handle_tool_call("hindsight_retain", {"content": "a fact"})
+
+    assert written == ["primary", "team"]
+
+
+def test_trusted_config_survives_an_unreadable_git_file(tmp_path: Path):
+    repo = tmp_path / "work" / "repo"
+    (repo / ".hindsight").mkdir(parents=True)
+    (repo / ".git").write_bytes(b"\xff\xfe not utf-8")
+    (repo / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n', encoding="utf-8")
+    config = {
+        "bank_id": "hermes",
+        "bank_id_template": "hermes-{project}",
+        "trusted_project_dirs": str(tmp_path / "work"),
+    }
+    provider = HindsightMemoryProvider()
+    with patch.object(plugin, "_load_config", return_value=config):
+        provider.initialize(session_id="s1", cwd=str(repo))
+    assert provider._bank_id == "acme"

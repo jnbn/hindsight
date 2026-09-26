@@ -413,7 +413,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._mirror_to_own_bank = False
         self._static_bank_id = "hermes"
         self._project, self._bank_source = "", "bank_id"
-        self._extra_bank_down_until: dict[str, float] = {}
+        self._extra_bank_down_until: dict[tuple[str, str], float] = {}
         self._additional_bank_ids: list[str] = []
         self._recall_additional_bank_ids: list[str] = []
         self._write_bank_ids: list[str] = ["hermes"]
@@ -1044,7 +1044,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 ordered.append(bank)
         return ordered
 
-    def _write_to_banks(self, bank_ids: list[str], write: Callable[[str], Any], *, label: str) -> None:
+    def _write_to_banks(self, bank_ids: list[str], write: Callable[[str], Any]) -> None:
         """Write to the primary bank, then to each extra bank with failures isolated.
 
         A failing primary raises straight away, before any extra bank is touched, so a
@@ -1054,31 +1054,35 @@ class HindsightMemoryProvider(MemoryProvider):
         """
         write(bank_ids[0])
         for bank_id in bank_ids[1:]:
-            if not self._extra_bank_available(bank_id):
+            if not self._extra_bank_available("retain", bank_id):
                 continue
             try:
                 write(bank_id)
             except Exception as exc:
-                self._log_bank_failure(label, bank_id, exc)
+                self._log_bank_failure("retain", bank_id, exc)
             else:
-                self._mark_bank_ok(bank_id)
+                self._mark_bank_ok("retain", bank_id)
 
-    def _extra_bank_available(self, bank_id: str) -> bool:
-        """False while an extra bank is cooling down after a failure."""
-        return time.monotonic() >= self._extra_bank_down_until.get(bank_id, 0.0)
+    def _extra_bank_available(self, operation: str, bank_id: str) -> bool:
+        """False while an extra bank is cooling down after a failed *operation* on it."""
+        return time.monotonic() >= self._extra_bank_down_until.get((operation, bank_id), 0.0)
 
-    def _log_bank_failure(self, label: str, bank_id: str, exc: BaseException) -> None:
-        """Start a cooldown for a failing extra bank, warning once per outage."""
-        if bank_id not in self._extra_bank_down_until:
-            logger.warning("Hindsight %s: skipping bank %s for %.0fs: %s", label, bank_id, _EXTRA_BANK_COOLDOWN, exc)
+    def _log_bank_failure(self, operation: str, bank_id: str, exc: BaseException) -> None:
+        """Start a cooldown for *operation* on a failing extra bank, warning once per outage.
+        Recall and writes cool down separately: a slow search must not stop writes."""
+        key = (operation, bank_id)
+        if key not in self._extra_bank_down_until:
+            logger.warning(
+                "Hindsight %s: skipping bank %s for %.0fs: %r", operation, bank_id, _EXTRA_BANK_COOLDOWN, exc
+            )
         else:
-            logger.debug("Hindsight %s: bank %s still failing: %s", label, bank_id, exc)
-        self._extra_bank_down_until[bank_id] = time.monotonic() + _EXTRA_BANK_COOLDOWN
+            logger.debug("Hindsight %s: bank %s still failing: %r", operation, bank_id, exc)
+        self._extra_bank_down_until[key] = time.monotonic() + _EXTRA_BANK_COOLDOWN
 
-    def _mark_bank_ok(self, bank_id: str) -> None:
-        """End an extra bank's outage on its first success."""
-        if self._extra_bank_down_until.pop(bank_id, None) is not None:
-            logger.info("Hindsight: bank %s is answering again", bank_id)
+    def _mark_bank_ok(self, operation: str, bank_id: str) -> None:
+        """End an extra bank's outage for *operation* on its first success."""
+        if self._extra_bank_down_until.pop((operation, bank_id), None) is not None:
+            logger.info("Hindsight %s: bank %s is answering again", operation, bank_id)
 
     def _build_recall_bank_ids(self) -> list[str]:
         """The banks recall searches: the write set (primary first), then each
@@ -1114,13 +1118,15 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._cwd and (trusted_dirs or uses_project):
             try:
                 root = _repository_root(self._cwd)
-                self._project = _project_name(root) if uses_project else ""
-                cwd_bank = _discover_cwd_bank_id(self._cwd, root, trusted_dirs)
             except Exception as exc:
-                logger.warning(
-                    "hindsight: repository lookup for %s failed (%s) — using the static bank", self._cwd, exc
-                )
-                self._project, cwd_bank = "", None
+                logger.warning("hindsight: repository lookup for %s failed: %r", self._cwd, exc)
+        if root is not None and trusted_dirs:
+            cwd_bank = _discover_cwd_bank_id(self._cwd, root, trusted_dirs)
+        if root is not None and uses_project:
+            try:
+                self._project = _project_name(root)
+            except Exception as exc:
+                logger.warning("hindsight: cannot name the project at %s: %r — {project} is empty", root, exc)
         if cwd_bank:
             self._bank_id, self._bank_source = cwd_bank, "repository config"
         else:
@@ -1322,7 +1328,7 @@ class HindsightMemoryProvider(MemoryProvider):
         bank_ids = [
             bank_id
             for i, bank_id in enumerate(self._build_recall_bank_ids())
-            if i == 0 or self._extra_bank_available(bank_id)
+            if i == 0 or self._extra_bank_available("recall", bank_id)
         ]
         kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         if self._recall_tags:
@@ -1353,7 +1359,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._log_bank_failure("recall", bank_id, resp)
                 continue
             if bank_id != bank_ids[0]:
-                self._mark_bank_ok(bank_id)
+                self._mark_bank_ok("recall", bank_id)
             for r in resp.results or []:
                 text = getattr(r, "text", None)
                 if text and text not in seen:
@@ -1540,7 +1546,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 if retain_async and track_ops:
                     self._track_retain_ops(resp, bank_id)
 
-            self._write_to_banks(bank_ids, _write, label=label)
+            self._write_to_banks(bank_ids, _write)
             logger.debug("Hindsight %s succeeded", label)
 
         return _job
@@ -1638,7 +1644,7 @@ class HindsightMemoryProvider(MemoryProvider):
             )
             self._retain_batch(item, bank_id=bank_id)
 
-        self._write_to_banks(list(self._write_bank_ids), _write, label="tool retain")
+        self._write_to_banks(list(self._write_bank_ids), _write)
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
 

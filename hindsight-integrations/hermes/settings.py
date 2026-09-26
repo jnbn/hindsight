@@ -137,7 +137,9 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
         return fallback
     try:
         rendered = template.format(**{k: _sanitize_bank_segment(v) for k, v in placeholders.items()})
-    except (KeyError, IndexError, ValueError) as exc:
+    except Exception as exc:
+        # str.format raises KeyError, IndexError, ValueError, AttributeError or TypeError
+        # depending on how the template is malformed; none of them may stop the provider.
         logger.warning("Invalid bank_id_template %r: %s — using fallback %r", template, exc, fallback)
         return fallback
     return re.sub(r"([-_])\1+", r"\1", rendered).strip("-_") or fallback
@@ -157,32 +159,33 @@ def _repository_root(start_dir: str) -> Path | None:
     return None
 
 
-def _main_repository_root(root: Path) -> Path:
-    """The main repository behind *root*: a linked worktree's ``.git`` file names its
-    ``gitdir``, whose ``commondir`` points at the shared ``.git`` directory. Anything else,
-    submodules included, is its own main repository."""
+def _main_repository(root: Path) -> tuple[Path, bool]:
+    """The main repository behind *root* and whether it is bare. A linked worktree's
+    ``.git`` file names its ``gitdir``, whose ``commondir`` points at the shared git
+    directory: ``<main>/.git`` for a normal checkout, the repository itself when bare.
+    Anything else, submodules included, is its own main repository."""
     git_file = root / ".git"
     if not git_file.is_file():
-        return root
+        return root, False
     text = git_file.read_text(encoding="utf-8").strip()
     if not text.startswith("gitdir:"):
-        return root
+        return root, False
     gitdir = (root / text[len("gitdir:") :].strip()).resolve()
     commondir_file = gitdir / "commondir"
     if not commondir_file.is_file():
-        return root
+        return root, False
     common = (gitdir / commondir_file.read_text(encoding="utf-8").strip()).resolve()
-    return common.parent if common.name == ".git" else common
+    return (common.parent, False) if common.name == ".git" else (common, True)
 
 
 def _project_name(root: Path | None) -> str:
     """Value of the ``{project}`` placeholder: the main repository's folder name, ``""``
-    when there is no repository. Only a bare main repository reached through a worktree
-    drops its ``.git`` suffix; a working tree in a folder named ``x.git`` stays ``x.git``."""
+    when there is no repository. Only a bare main repository drops its ``.git`` suffix,
+    so a checkout in a folder named ``x.git`` and its worktrees all resolve to ``x.git``."""
     if root is None:
         return ""
-    main = _main_repository_root(root)
-    return main.name if main == root else main.name.removesuffix(".git")
+    main, bare = _main_repository(root)
+    return main.name.removesuffix(".git") if bare else main.name
 
 
 def _discover_cwd_bank_id(start_dir: str, root: Path | None, trusted_dirs: List[str]) -> str | None:
