@@ -134,3 +134,82 @@ def test_provider_sync_turn_retains_to_all_write_banks():
 
     assert retained_banks == ["b1", "b2"]
     assert provider._pending_retain_ops == {("b1", "op-b1"), ("b2", "op-b2")}
+def _provider_with(cfg: dict) -> HindsightMemoryProvider:
+    provider = HindsightMemoryProvider()
+    provider._config = {"bank_id": cfg.get("bank_id", "hermes")}
+    provider._apply_connection_settings(cfg)
+    return provider
+
+
+def test_recall_only_banks_are_recalled_after_the_write_set_and_never_written():
+    provider = _provider_with(
+        {
+            "bank_id": "primary",
+            "additional_banks": ["shared"],
+            "recall_additional_banks": ["vault"],
+        }
+    )
+    assert provider._write_bank_ids == ["primary", "shared"]
+    assert provider._build_recall_bank_ids() == ["primary", "shared", "vault"]
+
+
+def test_recall_only_banks_accept_the_camel_case_alias():
+    provider = _provider_with({"bank_id": "primary", "recallAdditionalBanks": ["vault"]})
+    assert provider._write_bank_ids == ["primary"]
+    assert provider._build_recall_bank_ids() == ["primary", "vault"]
+
+
+def test_bank_in_both_lists_stays_writable_and_is_recalled_once():
+    provider = _provider_with(
+        {
+            "bank_id": "primary",
+            "additional_banks": ["shared"],
+            "recall_additional_banks": ["shared", "vault", " "],
+        }
+    )
+    assert provider._write_bank_ids == ["primary", "shared"]
+    assert provider._build_recall_bank_ids() == ["primary", "shared", "vault"]
+
+
+def test_recall_queries_recall_only_banks_last():
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
+    queried = []
+
+    def mock_run(op):
+        mock_client = MagicMock()
+
+        def arecall(bank_id, **kwargs):
+            queried.append(bank_id)
+            return SimpleNamespace(results=[SimpleNamespace(text=f"fact from {bank_id}")])
+
+        mock_client.arecall = arecall
+        return op(mock_client)
+
+    provider._run_hindsight_operation = mock_run
+    texts = [r.text for r in provider._recall("query")]
+    assert queried == ["primary", "vault"]
+    assert texts == ["fact from primary", "fact from vault"]
+
+
+def test_sync_turn_never_retains_to_recall_only_banks():
+    provider = _provider_with(
+        {
+            "bank_id": "primary",
+            "additional_banks": ["shared"],
+            "recall_additional_banks": ["vault"],
+        }
+    )
+    retained_banks = []
+
+    def mock_retain_batch(item, bank_id, **kwargs):
+        retained_banks.append(bank_id)
+        return SimpleNamespace(operation_id=f"op-{bank_id}")
+
+    provider._retain_batch = mock_retain_batch
+    provider._ensure_writer = MagicMock()
+    provider._register_atexit = MagicMock()
+
+    provider.sync_turn("User message", "Assistant reply", session_id="s1")
+    provider._retain_queue.get_nowait()()
+
+    assert retained_banks == ["primary", "shared"]

@@ -64,6 +64,15 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Extra Hindsight banks to write to and recall from, in priority order (comma-separated). Off = single-bank behavior.",
         ),
         ProviderField(
+            key="recall_additional_banks",
+            label="Recall-only banks",
+            kind=KIND_TEXT,
+            default="",
+            aliases=("recallAdditionalBanks",),
+            inline=True,
+            description="Extra Hindsight banks to recall from but never write to, searched after the write banks (comma-separated). A bank also in Additional banks stays writable.",
+        ),
+        ProviderField(
             key="recall_budget",
             label="Recall budget",
             kind=KIND_SELECT,

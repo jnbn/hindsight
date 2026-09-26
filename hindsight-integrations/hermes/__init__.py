@@ -409,6 +409,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission, self._bank_retain_mission = "", None
         self._mirror_to_own_bank = False
         self._additional_bank_ids: list[str] = []
+        self._recall_additional_bank_ids: list[str] = []
         self._write_bank_ids: list[str] = ["hermes"]
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
         self._prefetch_method = "recall"  # "recall" or "reflect"
@@ -1036,6 +1037,21 @@ class HindsightMemoryProvider(MemoryProvider):
                 ordered.append(bank)
         return ordered
 
+    def _build_recall_bank_ids(self) -> list[str]:
+        """The banks recall searches: the write set (primary first), then each
+        ``recall_additional_banks`` entry not already in it.
+
+        Recall-only banks are read and never written, so a shared bank can be
+        consulted without this provider's conversations landing in it. A bank
+        listed in both ``additional_banks`` and ``recall_additional_banks`` stays
+        writable. With no recall-only banks this is exactly the write set.
+        """
+        ordered = list(getattr(self, "_write_bank_ids", None) or [self._bank_id])
+        for bank in getattr(self, "_recall_additional_bank_ids", None) or []:
+            if bank not in ordered:
+                ordered.append(bank)
+        return ordered
+
     def _apply_connection_settings(self, cfg: dict) -> None:
         """Endpoint, bank and mode selectors from *cfg* (env fallbacks where documented)."""
         self._api_key = _cloud_api_key(cfg)
@@ -1072,6 +1088,11 @@ class HindsightMemoryProvider(MemoryProvider):
             b.strip() for b in (cfg.get("additional_banks") or []) if isinstance(b, str) and b.strip()
         ]
         self._write_bank_ids = self._build_write_bank_ids()
+        # Recall-only banks (optional, default off): searched after the write
+        # set, never written. ``recallAdditionalBanks`` is the name the
+        # claude-code and omo integrations use for the same setting.
+        recall_only = cfg.get("recall_additional_banks") or cfg.get("recallAdditionalBanks") or []
+        self._recall_additional_bank_ids = [b.strip() for b in recall_only if isinstance(b, str) and b.strip()]
         budget = cfg.get("recall_budget") or cfg.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
         memory_mode = cfg.get("memory_mode", "hybrid")
@@ -1238,9 +1259,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _recall(self, query: str) -> list:
         """Semantic recall across the write set (primary bank first, then
-        mirrors/additional banks), deduped by text. Single-bank configs query
-        exactly ``_bank_id`` — identical to the pre-multi-bank behavior."""
-        bank_ids = list(getattr(self, "_write_bank_ids", None) or [self._bank_id])
+        mirrors/additional banks), then any recall-only banks, deduped by text.
+        Single-bank configs query exactly ``_bank_id`` — identical to the
+        pre-multi-bank behavior."""
+        bank_ids = self._build_recall_bank_ids()
         results, seen = [], set()
         for bank_id in bank_ids:
             kwargs: dict = {
