@@ -1318,7 +1318,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _recall(self, query: str) -> list:
         """Semantic recall across the write set (primary bank first, then
-        mirrors/additional banks), then any recall-only banks, deduped by text.
+        mirrors/additional banks), then any recall-only banks. A result whose text an
+        earlier bank already returned is dropped.
 
         All banks are queried concurrently, each with the configured budget and
         ``recall_max_tokens``. A primary-bank failure raises, exactly as the
@@ -1360,11 +1361,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 continue
             if bank_id != bank_ids[0]:
                 self._mark_bank_ok("recall", bank_id)
-            for r in resp.results or []:
-                text = getattr(r, "text", None)
-                if text and text not in seen:
-                    seen.add(text)
-                    results.append(r)
+            # Drop only what an earlier bank already returned; one bank's own answer passes
+            # through untouched, so a single-bank recall is exactly the server's response.
+            kept = [r for r in resp.results or [] if getattr(r, "text", None) not in seen]
+            results.extend(kept)
+            seen.update(text for r in kept if (text := getattr(r, "text", None)))
         return results
 
     def _reflect(self, query: str) -> str | None:

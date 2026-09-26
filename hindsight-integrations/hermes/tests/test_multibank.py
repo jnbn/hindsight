@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import hindsight_hermes as plugin
-from hindsight_hermes.settings import _discover_cwd_bank_id, _normalize_string_list, _repository_root
+from hindsight_hermes.settings import _discover_cwd_bank_id, _repository_root
 
 HindsightMemoryProvider = plugin.HindsightMemoryProvider
 
@@ -405,11 +405,6 @@ def test_empty_nested_bank_id_never_puts_an_empty_bank_in_the_write_set(tmp_path
     assert provider._write_bank_ids == ["repo", "hermes"]
 
 
-def test_bracketed_text_that_is_not_json_is_read_as_a_list():
-    assert _normalize_string_list("[team, vault]") == ["team", "vault"]
-    assert _normalize_string_list("['team', \"vault\"]") == ["team", "vault"]
-
-
 def test_a_hung_extra_bank_cannot_cost_the_primary_its_results():
     """Runs through the real _run_sync deadline, so it fails if the extra bank's own
     deadline were ever allowed past the operation's."""
@@ -553,3 +548,15 @@ def test_trusted_config_survives_an_unreadable_git_file(tmp_path: Path):
     with patch.object(plugin, "_load_config", return_value=config):
         provider.initialize(session_id="s1", cwd=str(repo))
     assert provider._bank_id == "acme"
+
+
+def test_single_bank_recall_returns_the_server_response_unchanged():
+    provider = _provider_with({"bank_id": "primary"})
+    results = [SimpleNamespace(text="same"), SimpleNamespace(text="same"), SimpleNamespace(text=None)]
+
+    class _Client:
+        async def arecall(self, bank_id, **kwargs):
+            return SimpleNamespace(results=results)
+
+    provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
+    assert provider._recall("q") == results

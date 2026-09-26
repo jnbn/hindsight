@@ -64,14 +64,10 @@ def _daemon_llm_provider(provider: str) -> str:
 
 
 def _normalize_string_list(value: Any) -> List[str]:
-    """Normalize a list-valued setting to a deduplicated list of non-empty strings.
-
-    Accepts a list, a JSON-encoded list (``'["a", "b"]'``) or comma-separated text
-    (``"a, b"``): the settings panel stores ``KIND_TEXT`` fields as text, while a
-    hand-written ``config.json`` usually holds a real list. Bracketed text that is not
-    valid JSON (``[a, b]``) is read as the comma-separated text inside the brackets.
-    Use the JSON form for a value that itself contains a comma.
-    """
+    """Normalize a list-valued setting (retain tags, bank lists) to a deduplicated list of
+    non-empty strings. Accepts a list, a JSON-encoded list (``'["a", "b"]'``) or
+    comma-separated text (``"a, b"``): the settings panel stores ``KIND_TEXT`` fields as
+    text, while a hand-written ``config.json`` usually holds a real list."""
     if value is None:
         return []
     raw_items = value if isinstance(value, list) else [value]
@@ -81,12 +77,10 @@ def _normalize_string_list(value: Any) -> List[str]:
         if text.startswith("["):
             with contextlib.suppress(Exception):
                 parsed = json.loads(text)
-            if not isinstance(parsed, list) and text.endswith("]"):
-                text = text[1:-1]
         raw_items = parsed if isinstance(parsed, list) else text.split(",")
     normalized: list[str] = []
     for item in raw_items:
-        entry = str(item).strip().strip("'\"").strip()
+        entry = str(item).strip()
         if entry and entry not in normalized:
             normalized.append(entry)
     return normalized
