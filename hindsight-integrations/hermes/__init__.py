@@ -57,7 +57,7 @@ from .settings import (
     _PROVIDER_DEFAULT_MODELS,
     _VALID_BUDGETS,
     _daemon_llm_provider,
-    _derive_workspace_from_cwd,
+    _derive_project_from_cwd,
     _discover_cwd_bank_id,
     _normalize_observation_scopes,
     _normalize_retain_tags,
@@ -586,7 +586,7 @@ class HindsightMemoryProvider(MemoryProvider):
             },
             {
                 "key": "bank_id_template",
-                "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}",
+                "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {project}, {platform}, {user}, {session}. {project} is the git repository name (shared across worktrees, empty outside a repository). Example: hermes-{project}",
                 "default": "",
             },
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
@@ -1089,17 +1089,14 @@ class HindsightMemoryProvider(MemoryProvider):
         if cwd_bank:
             self._bank_id = cwd_bank
         else:
-            # If agent_workspace is not provided or defaulted to "hermes", derive it from cwd.
-            workspace = getattr(self, "_agent_workspace", "")
-            if (not workspace or workspace == "hermes") and getattr(self, "_cwd", None):
-                derived = _derive_workspace_from_cwd(self._cwd)
-                if derived:
-                    workspace = derived
+            # {project} walks the filesystem, so only when a template asks for it.
+            project = _derive_project_from_cwd(self._cwd) if "{project}" in self._bank_id_template else ""
             self._bank_id = _resolve_bank_id_template(
                 self._bank_id_template,
                 fallback=cfg.get("bank_id") or banks.get("bankId", "hermes"),
                 profile=self._agent_identity,
-                workspace=workspace,
+                workspace=self._agent_workspace,
+                project=project,
                 platform=self._platform,
                 user=self._user_id,
                 session=self._session_id,

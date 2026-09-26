@@ -64,30 +64,50 @@ def test_provider_initializes_with_cwd_bank(tmp_path: Path):
     assert provider._bank_id == "project-x-bank"
 
 
-def test_provider_derives_workspace_from_cwd(tmp_path: Path):
-    git_repo = tmp_path / "my-awesome-repo"
-    (git_repo / ".git").mkdir(parents=True)
-    sub = git_repo / "pkg" / "sub"
+def _bank_for(cwd: str, template: str, **session) -> str:
+    provider = HindsightMemoryProvider()
+    with patch.object(plugin, "_load_config", return_value={"bank_id": "hermes", "bank_id_template": template}):
+        provider.initialize(session_id="s", cwd=cwd, **session)
+    return provider._bank_id
+
+
+def test_project_placeholder_is_the_git_repository_name(tmp_path: Path):
+    repo = tmp_path / "my-awesome-repo"
+    (repo / ".git").mkdir(parents=True)
+    sub = repo / "pkg" / "sub"
     sub.mkdir(parents=True)
 
-    provider = HindsightMemoryProvider()
-    with patch.object(plugin, "_load_config", return_value={"bank_id": "hermes", "bank_id_template": "{workspace}"}):
-        provider.initialize(
-            session_id="s2",
-            cwd=str(sub),
-            agent_workspace="hermes",  # upstream default fallback
-        )
-    assert provider._bank_id == "my-awesome-repo"
+    assert _bank_for(str(sub), "{project}") == "my-awesome-repo"
+    assert _bank_for(str(sub), "hermes-{project}") == "hermes-my-awesome-repo"
 
-    # In user home / root with no project git repo, falls back to default bank
-    provider_home = HindsightMemoryProvider()
-    with patch.object(plugin, "_load_config", return_value={"bank_id": "hermes", "bank_id_template": "{workspace}"}):
-        provider_home.initialize(
-            session_id="s3",
-            cwd=str(Path.home()),
-            agent_workspace="hermes",
-        )
-    assert provider_home._bank_id == "hermes"
+
+def test_project_placeholder_resolves_a_linked_worktree_to_its_main_repository(tmp_path: Path):
+    main = tmp_path / "main-repo"
+    worktree_git = main / ".git" / "worktrees" / "feature-x"
+    worktree_git.mkdir(parents=True)
+    (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = tmp_path / "main-repo-feature-x"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+
+    assert _bank_for(str(worktree), "{project}") == "main-repo"
+
+
+def test_project_placeholder_is_empty_outside_a_repository(tmp_path: Path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    assert _bank_for(str(scratch), "{project}") == "hermes"
+    assert _bank_for(str(scratch), "hermes-{project}") == "hermes"
+    assert _bank_for(str(Path.home()), "{project}") == "hermes"
+
+
+def test_workspace_placeholder_keeps_its_upstream_meaning(tmp_path: Path):
+    repo = tmp_path / "some-repo"
+    (repo / ".git").mkdir(parents=True)
+
+    assert _bank_for(str(repo), "hermes-{workspace}", agent_workspace="hermes") == "hermes-hermes"
+    assert _bank_for(str(repo), "{workspace}", agent_workspace="team-a") == "team-a"
 
 
 def test_provider_multibank_write_and_recall_order():

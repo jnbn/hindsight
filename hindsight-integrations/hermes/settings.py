@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, List
 
 # Log under the plugin package's own logger name (loader-path independent).
@@ -129,7 +130,7 @@ def _sanitize_bank_segment(value: str) -> str:
 
 
 def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str) -> str:
-    """Render a bank_id template ({profile}, {workspace}, {platform}, {user}, {session}),
+    """Render a bank_id template ({profile}, {workspace}, {project}, {platform}, {user}, {session}),
     sanitizing each placeholder; the ``-``/``_`` runs empty placeholders leave are
     collapsed (``hermes-{user}`` -> ``hermes``). Empty/invalid template -> *fallback*."""
     if not template:
@@ -154,7 +155,6 @@ def _discover_cwd_bank_id(start_dir: str | None = None) -> str | None:
         return None
 
     import tomllib
-    from pathlib import Path
 
     try:
         d = Path(start_dir).resolve()
@@ -177,31 +177,47 @@ def _discover_cwd_bank_id(start_dir: str | None = None) -> str | None:
     return None
 
 
-def _derive_workspace_from_cwd(start_dir: str | None = None) -> str:
-    """Derive the workspace name from *start_dir*.
+def _derive_project_from_cwd(start_dir: str | None = None) -> str:
+    """Name of the git repository containing *start_dir*, for the ``{project}`` placeholder.
 
-    Walks up to find a git repository root (containing ``.git``), returning its
-    directory name. If outside a git repository or at user home directory / root,
-    returns an empty string so the fallback bank (e.g. 'hermes') is used.
+    A linked worktree resolves to its main repository through git's ``commondir``, so every
+    worktree of a repo shares one bank. Returns ``""`` outside a git repository and for a
+    repository rooted at the home directory or the filesystem root, so the template collapses
+    to the static fallback bank instead of naming a bank after an arbitrary folder.
     """
     if not start_dir:
         return ""
-    from pathlib import Path
-
     try:
-        d = Path(start_dir).resolve()
+        start = Path(start_dir).resolve()
         home = Path.home().resolve()
-        # If at user home or root without a git repo, no project workspace
-        if d in {home, Path(d.root)}:
-            return ""
-        for folder in (d, *d.parents):
+        for folder in (start, *start.parents):
             if folder in {home, Path(folder.root)}:
-                break
-            if (folder / ".git").exists():
+                return ""
+            marker = folder / ".git"
+            if marker.is_dir():
                 return folder.name
-        # Fallback to directory name only if not home or root
-        if d != home and d.name:
-            return d.name
+            if marker.is_file():
+                return _main_repository_name(marker) or folder.name
     except Exception as exc:
-        logger.debug("hindsight: derive workspace from cwd failed: %s", exc)
+        logger.debug("hindsight: derive project from cwd failed: %s", exc)
     return ""
+
+
+def _main_repository_name(git_file: Path) -> str:
+    """Main repository name behind a worktree's ``.git`` file (``gitdir: <path>``), or ``""``.
+
+    ``<gitdir>/commondir`` points at the shared ``.git`` directory; its parent is the main
+    worktree. Submodules and anything unrecognised return ``""`` so the caller keeps the
+    folder name.
+    """
+    text = git_file.read_text(encoding="utf-8").strip()
+    if not text.startswith("gitdir:"):
+        return ""
+    gitdir = (git_file.parent / text[len("gitdir:") :].strip()).resolve()
+    commondir_file = gitdir / "commondir"
+    if not commondir_file.is_file():
+        return ""
+    common = (gitdir / commondir_file.read_text(encoding="utf-8").strip()).resolve()
+    if common.name == ".git":
+        return common.parent.name
+    return common.name.removesuffix(".git")
