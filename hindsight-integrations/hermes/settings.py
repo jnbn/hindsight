@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import re
+import string
 from pathlib import Path
 from typing import Any, List
 
@@ -62,17 +63,14 @@ def _daemon_llm_provider(provider: str) -> str:
     return "openai" if provider in _OPENAI_WIRE_PROVIDERS else provider
 
 
-def _normalize_retain_tags(value: Any) -> List[str]:
-    """Normalize tag config/tool values to a deduplicated list of strings."""
-    return _normalize_string_list(value)
-
-
 def _normalize_string_list(value: Any) -> List[str]:
     """Normalize a list-valued setting to a deduplicated list of non-empty strings.
 
-    Accepts a list, a JSON-encoded list (``'["a", "b"]'``) or a comma-separated string
-    (``"a, b"``), since the settings panel stores ``KIND_TEXT`` fields as text while
-    ``config.json`` written by hand usually holds a real list.
+    Accepts a list, a JSON-encoded list (``'["a", "b"]'``) or comma-separated text
+    (``"a, b"``): the settings panel stores ``KIND_TEXT`` fields as text, while a
+    hand-written ``config.json`` usually holds a real list. Bracketed text that is not
+    valid JSON (``[a, b]``) is read as the comma-separated text inside the brackets.
+    Use the JSON form for a value that itself contains a comma.
     """
     if value is None:
         return []
@@ -83,12 +81,14 @@ def _normalize_string_list(value: Any) -> List[str]:
         if text.startswith("["):
             with contextlib.suppress(Exception):
                 parsed = json.loads(text)
+            if not isinstance(parsed, list) and text.endswith("]"):
+                text = text[1:-1]
         raw_items = parsed if isinstance(parsed, list) else text.split(",")
     normalized: list[str] = []
     for item in raw_items:
-        tag = str(item).strip()
-        if tag and tag not in normalized:
-            normalized.append(tag)
+        entry = str(item).strip().strip("'\"").strip()
+        if entry and entry not in normalized:
+            normalized.append(entry)
     return normalized
 
 
@@ -143,29 +143,73 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
     return re.sub(r"([-_])\1+", r"\1", rendered).strip("-_") or fallback
 
 
-def _discover_cwd_bank_id(start_dir: str | None = None, trusted_dirs: List[str] | None = None) -> str | None:
+def _repository_root(start_dir: str) -> Path | None:
+    """The nearest folder at or above *start_dir* holding ``.git`` (a directory, or a
+    worktree's ``.git`` file). ``None`` outside a repository, and for a repository rooted
+    at the home directory or the filesystem root."""
+    start = Path(start_dir).resolve()
+    home = Path.home().resolve()
+    for folder in (start, *start.parents):
+        if folder in {home, Path(folder.root)}:
+            return None
+        if (folder / ".git").exists():
+            return folder
+    return None
+
+
+def _main_repository_root(root: Path) -> Path:
+    """The main repository behind *root*: a linked worktree's ``.git`` file names its
+    ``gitdir``, whose ``commondir`` points at the shared ``.git`` directory. Anything else,
+    submodules included, is its own main repository."""
+    git_file = root / ".git"
+    if not git_file.is_file():
+        return root
+    text = git_file.read_text(encoding="utf-8").strip()
+    if not text.startswith("gitdir:"):
+        return root
+    gitdir = (root / text[len("gitdir:") :].strip()).resolve()
+    commondir_file = gitdir / "commondir"
+    if not commondir_file.is_file():
+        return root
+    common = (gitdir / commondir_file.read_text(encoding="utf-8").strip()).resolve()
+    return common.parent if common.name == ".git" else common
+
+
+def _project_name(root: Path | None) -> str:
+    """Value of the ``{project}`` placeholder: the main repository's folder name (a bare
+    repository drops its ``.git`` suffix), ``""`` when there is no repository."""
+    if root is None:
+        return ""
+    return _main_repository_root(root).name.removesuffix(".git")
+
+
+def _discover_cwd_bank_id(start_dir: str, root: Path | None, trusted_dirs: List[str]) -> str | None:
     """``bank_id`` from the nearest ``.hindsight/config.toml`` inside a trusted repository.
 
     A repository can carry this file to name its bank, but a cloned repository is not
-    trusted by default: the file is read only when the repository root lies inside one of
-    *trusted_dirs* (``trusted_project_dirs`` in the config). The walk goes from *start_dir*
-    up to the repository root and never above it, so a file in the home directory or any
-    parent folder is never picked up. Only ``bank_id`` is read, with stdlib ``tomllib``.
-    Never raises: an unreadable or malformed file logs a warning and the walk continues.
-    Returns ``None`` when nothing applies.
+    trusted by default: the file is read only when the main repository behind *root* (the
+    same one ``{project}`` names, so a worktree follows its main checkout) lies inside one
+    of *trusted_dirs*. Relative entries are ignored, since they would resolve against
+    whatever directory Hermes was started from. The walk goes from *start_dir* up to
+    *root* and never above it. Only ``bank_id`` is read, with stdlib ``tomllib``. Never
+    raises: an unreadable or malformed file logs a warning and the walk continues.
     """
-    if not start_dir or not trusted_dirs:
+    if root is None or not trusted_dirs:
         return None
 
     import tomllib
 
     try:
-        root = _repository_root(start_dir)
-        if root is None:
-            return None
-        trusted = [Path(d).expanduser().resolve() for d in trusted_dirs]
-        if not any(root == t or t in root.parents for t in trusted):
-            logger.debug("hindsight: %s is not under trusted_project_dirs — ignoring its config", root)
+        trusted = []
+        for entry in trusted_dirs:
+            path = Path(entry).expanduser()
+            if path.is_absolute():
+                trusted.append(path.resolve())
+            else:
+                logger.warning("hindsight: ignoring relative trusted_project_dirs entry %r", entry)
+        main = _main_repository_root(root)
+        if not any(main == t or t in main.parents for t in trusted):
+            logger.debug("hindsight: %s is not under trusted_project_dirs — ignoring its config", main)
             return None
         start = Path(start_dir).resolve()
         for folder in (start, *start.parents):
@@ -186,58 +230,10 @@ def _discover_cwd_bank_id(start_dir: str | None = None, trusted_dirs: List[str] 
     return None
 
 
-def _repository_root(start_dir: str) -> Path | None:
-    """The nearest folder at or above *start_dir* holding ``.git`` (a directory, or a
-    worktree's ``.git`` file). ``None`` outside a repository, and for a repository rooted
-    at the home directory or the filesystem root."""
-    start = Path(start_dir).resolve()
-    home = Path.home().resolve()
-    for folder in (start, *start.parents):
-        if folder in {home, Path(folder.root)}:
-            return None
-        if (folder / ".git").exists():
-            return folder
-    return None
-
-
-def _derive_project_from_cwd(start_dir: str | None = None) -> str:
-    """Name of the git repository containing *start_dir*, for the ``{project}`` placeholder.
-
-    A linked worktree resolves to its main repository through git's ``commondir``, so every
-    worktree of a repo shares one bank. Returns ``""`` outside a git repository and for a
-    repository rooted at the home directory or the filesystem root, so the template collapses
-    to the static fallback bank instead of naming a bank after an arbitrary folder.
-    """
-    if not start_dir:
-        return ""
+def _template_fields(template: str) -> set[str]:
+    """Placeholder names *template* uses, parsed the way ``str.format`` does, so
+    ``{project:.30}`` and ``{project!s}`` count as ``project``."""
     try:
-        root = _repository_root(start_dir)
-        if root is None:
-            return ""
-        marker = root / ".git"
-        if marker.is_file():
-            return _main_repository_name(marker) or root.name
-        return root.name
-    except Exception as exc:
-        logger.debug("hindsight: derive project from cwd failed: %s", exc)
-    return ""
-
-
-def _main_repository_name(git_file: Path) -> str:
-    """Main repository name behind a worktree's ``.git`` file (``gitdir: <path>``), or ``""``.
-
-    ``<gitdir>/commondir`` points at the shared ``.git`` directory; its parent is the main
-    worktree. Submodules and anything unrecognised return ``""`` so the caller keeps the
-    folder name.
-    """
-    text = git_file.read_text(encoding="utf-8").strip()
-    if not text.startswith("gitdir:"):
-        return ""
-    gitdir = (git_file.parent / text[len("gitdir:") :].strip()).resolve()
-    commondir_file = gitdir / "commondir"
-    if not commondir_file.is_file():
-        return ""
-    common = (gitdir / commondir_file.read_text(encoding="utf-8").strip()).resolve()
-    if common.name == ".git":
-        return common.parent.name
-    return common.name.removesuffix(".git")
+        return {field.split(".")[0].split("[")[0] for _, field, _, _ in string.Formatter().parse(template) if field}
+    except ValueError:
+        return set()

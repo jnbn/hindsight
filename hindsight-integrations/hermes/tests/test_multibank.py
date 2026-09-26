@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import hindsight_hermes as plugin
-from hindsight_hermes.settings import _discover_cwd_bank_id
+from hindsight_hermes.settings import _discover_cwd_bank_id, _normalize_string_list, _repository_root
 
 HindsightMemoryProvider = plugin.HindsightMemoryProvider
 
@@ -36,6 +36,10 @@ def _fake_recall(provider, answers: dict, queried: list | None = None) -> None:
     provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
 
 
+def _discover(start: Path, trusted: list) -> str | None:
+    return _discover_cwd_bank_id(str(start), _repository_root(str(start)), trusted)
+
+
 def _repo_with_config(root: Path, bank: str) -> Path:
     (root / ".git").mkdir(parents=True)
     (root / ".hindsight").mkdir()
@@ -47,13 +51,13 @@ def _repo_with_config(root: Path, bank: str) -> Path:
 
 def test_trusted_repository_config_sets_the_bank(tmp_path: Path):
     sub = _repo_with_config(tmp_path / "work" / "my_project", "project-bank-alpha")
-    assert _discover_cwd_bank_id(str(sub), [str(tmp_path / "work")]) == "project-bank-alpha"
+    assert _discover(sub, [str(tmp_path / "work")]) == "project-bank-alpha"
 
 
 def test_repository_config_is_ignored_unless_its_folder_is_trusted(tmp_path: Path):
     sub = _repo_with_config(tmp_path / "downloads" / "cloned", "attacker-bank")
-    assert _discover_cwd_bank_id(str(sub), []) is None
-    assert _discover_cwd_bank_id(str(sub), [str(tmp_path / "work")]) is None
+    assert _discover(sub, []) is None
+    assert _discover(sub, [str(tmp_path / "work")]) is None
 
 
 def test_repository_config_is_never_read_above_the_repository_root(tmp_path: Path):
@@ -63,7 +67,7 @@ def test_repository_config_is_never_read_above_the_repository_root(tmp_path: Pat
     repo = outer / "repo"
     (repo / ".git").mkdir(parents=True)
 
-    assert _discover_cwd_bank_id(str(repo), [str(outer)]) is None
+    assert _discover(repo, [str(outer)]) is None
 
 
 def test_repository_config_outside_a_repository_is_ignored(tmp_path: Path):
@@ -71,7 +75,7 @@ def test_repository_config_outside_a_repository_is_ignored(tmp_path: Path):
     (folder / ".hindsight").mkdir(parents=True)
     (folder / ".hindsight" / "config.toml").write_text('bank_id = "notes"\n', encoding="utf-8")
 
-    assert _discover_cwd_bank_id(str(folder), [str(tmp_path / "work")]) is None
+    assert _discover(folder, [str(tmp_path / "work")]) is None
 
 
 def test_provider_uses_trusted_repository_config_over_the_template(tmp_path: Path):
@@ -334,17 +338,17 @@ def test_turn_retain_continues_past_a_failing_extra_bank(caplog):
         provider._retain_queue.get_nowait()()
 
     assert written == ["primary", "broken", "shared"]
-    assert "bank broken failed" in caplog.text
+    assert "skipping bank broken" in caplog.text
 
 
-def test_turn_retain_still_raises_when_the_primary_fails_after_trying_the_rest():
+def test_turn_retain_raises_when_the_primary_fails_before_touching_extra_banks():
     provider = _provider_with({"bank_id": "primary", "additional_banks": ["shared"]})
     written = _fake_retain(provider, failing={"primary"})
 
     provider.sync_turn("User message", "Assistant reply", session_id="s1")
     with pytest.raises(RuntimeError, match="primary unavailable"):
         provider._retain_queue.get_nowait()()
-    assert written == ["primary", "shared"]
+    assert written == ["primary"]
 
 
 def test_retain_tool_reports_success_when_only_an_extra_bank_fails():
@@ -363,7 +367,7 @@ def test_retain_tool_reports_failure_when_the_primary_fails():
 
     result = provider.handle_tool_call("hindsight_retain", {"content": "a fact"})
 
-    assert written == ["primary", "shared"]
+    assert written == ["primary"]
     assert "Failed to store memory: primary unavailable" in result
 
 
@@ -377,3 +381,68 @@ def test_mirror_uses_the_nested_bank_id_form_like_the_fallback(tmp_path: Path):
 
     assert provider._bank_id == "repo"
     assert provider._write_bank_ids == ["repo", "personal"]
+
+
+def test_a_hung_extra_bank_cannot_cost_the_primary_its_results():
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["slow"]})
+    provider._timeout = 0.5
+
+    class _Client:
+        async def arecall(self, bank_id, **kwargs):
+            if bank_id == "slow":
+                await asyncio.sleep(5)
+            return SimpleNamespace(results=[SimpleNamespace(text=f"from {bank_id}")])
+
+    provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
+    assert [r.text for r in provider._recall("q")] == ["from primary"]
+
+
+def test_worktree_trust_follows_the_main_repository(tmp_path: Path):
+    main = tmp_path / "work" / "app"
+    worktree_git = main / ".git" / "worktrees" / "wt"
+    worktree_git.mkdir(parents=True)
+    (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = tmp_path / "elsewhere" / "app-wt"
+    (worktree / ".hindsight").mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+    (worktree / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n', encoding="utf-8")
+
+    assert _discover(worktree, [str(tmp_path / "work")]) == "acme"
+    assert _discover(worktree, [str(tmp_path / "elsewhere")]) is None
+
+
+def test_relative_trusted_folders_are_ignored(tmp_path: Path, monkeypatch):
+    sub = _repo_with_config(tmp_path / "cloned", "attacker-bank")
+    monkeypatch.chdir(tmp_path)
+    assert _discover(sub, [".", "cloned"]) is None
+
+
+def test_project_placeholder_is_found_with_a_format_spec(tmp_path: Path):
+    repo = tmp_path / "long-repository-name"
+    (repo / ".git").mkdir(parents=True)
+    assert _bank_for(str(repo), "{project:.4}") == "long"
+
+
+def test_empty_nested_bank_id_never_puts_an_empty_bank_in_the_write_set(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config = {"banks": {"hermes": {"bankId": ""}}, "bank_id_template": "{project}", "mirror_to_own_bank": True}
+    provider = HindsightMemoryProvider()
+    with patch.object(plugin, "_load_config", return_value=config):
+        provider.initialize(session_id="s1", cwd=str(repo))
+    assert provider._write_bank_ids == ["repo", "hermes"]
+
+
+def test_a_failing_extra_bank_warns_once(caplog):
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
+    _fake_recall(provider, {"primary": ["from primary"], "vault": RuntimeError("vault down")})
+    with caplog.at_level(logging.DEBUG):
+        provider._recall("q")
+        provider._recall("q")
+    warnings = [r for r in caplog.records if "skipping bank vault" in r.getMessage()]
+    assert [r.levelno for r in warnings] == [logging.WARNING, logging.DEBUG]
+
+
+def test_bracketed_text_that_is_not_json_is_read_as_a_list():
+    assert _normalize_string_list("[team, vault]") == ["team", "vault"]
+    assert _normalize_string_list("['team', \"vault\"]") == ["team", "vault"]

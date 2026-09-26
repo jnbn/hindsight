@@ -57,18 +57,22 @@ from .settings import (
     _PROVIDER_DEFAULT_MODELS,
     _VALID_BUDGETS,
     _daemon_llm_provider,
-    _derive_project_from_cwd,
     _discover_cwd_bank_id,
     _normalize_observation_scopes,
-    _normalize_retain_tags,
     _normalize_string_list,
     _parse_int_setting,
+    _project_name,
+    _repository_root,
     _resolve_bank_id_template,
+    _template_fields,
 )
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_MODES = {"local", "local_embedded"}
+# Share of the operation timeout an extra recall bank may use, so a slow extra bank
+# always gives up before the operation that also carries the primary's result does.
+_EXTRA_BANK_TIMEOUT_SHARE = 0.8
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
@@ -405,6 +409,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission, self._bank_retain_mission = "", None
         self._mirror_to_own_bank = False
         self._static_bank_id = "hermes"
+        self._project, self._bank_source = "", "bank_id"
+        self._failed_extra_banks: set[str] = set()
         self._additional_bank_ids: list[str] = []
         self._recall_additional_bank_ids: list[str] = []
         self._write_bank_ids: list[str] = ["hermes"]
@@ -989,15 +995,18 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_method,
             client_version,
         )
-        if self._bank_id_template:
+        if self._bank_id_template or self._bank_source == "repository config":
             logger.debug(
-                "Hindsight bank resolved from template %r: profile=%s workspace=%s platform=%s user=%s -> bank=%s",
+                "Hindsight bank %s from %s (template %r: profile=%s workspace=%s project=%s platform=%s user=%s, cwd=%s)",
+                self._bank_id,
+                self._bank_source,
                 self._bank_id_template,
                 self._agent_identity,
                 self._agent_workspace,
+                self._project,
                 self._platform,
                 self._user_id,
-                self._bank_id,
+                self._cwd,
             )
         logger.debug(
             "Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
@@ -1032,25 +1041,26 @@ class HindsightMemoryProvider(MemoryProvider):
                 ordered.append(bank)
         return ordered
 
-    @staticmethod
-    def _write_to_banks(bank_ids: list[str], write: Callable[[str], Any], *, label: str) -> None:
-        """Call *write* once per bank, isolating failures so one bank cannot stop the rest.
+    def _write_to_banks(self, bank_ids: list[str], write: Callable[[str], Any], *, label: str) -> None:
+        """Write to the primary bank, then to each extra bank with failures isolated.
 
-        Every bank is attempted. A failing extra bank is logged and skipped; a failing
-        primary (first) bank is re-raised once the others have been tried, so callers
-        report a failed retain exactly as the single-bank path did.
+        A failing primary raises straight away, before any extra bank is touched, so a
+        failed retain is reported exactly as on the single-bank path and a retry cannot
+        duplicate the item in the extra banks. A failing extra bank is logged and skipped.
         """
-        primary_error: Exception | None = None
-        for index, bank_id in enumerate(bank_ids):
+        write(bank_ids[0])
+        for bank_id in bank_ids[1:]:
             try:
                 write(bank_id)
             except Exception as exc:
-                if index == 0:
-                    primary_error = exc
-                else:
-                    logger.warning("Hindsight %s: bank %s failed, continuing: %s", label, bank_id, exc)
-        if primary_error is not None:
-            raise primary_error
+                self._log_bank_failure(label, bank_id, exc)
+
+    def _log_bank_failure(self, label: str, bank_id: str, exc: Exception) -> None:
+        """Warn the first time an extra bank fails, then log at debug level, so a bank
+        that is permanently misconfigured does not print a warning on every turn."""
+        level = logging.DEBUG if bank_id in self._failed_extra_banks else logging.WARNING
+        self._failed_extra_banks.add(bank_id)
+        logger.log(level, "Hindsight %s: skipping bank %s: %s", label, bank_id, exc)
 
     def _build_recall_bank_ids(self) -> list[str]:
         """The banks recall searches: the write set (primary first), then each
@@ -1077,24 +1087,28 @@ class HindsightMemoryProvider(MemoryProvider):
         banks = cfg_get(cfg, "banks", "hermes", default={})
         self._bank_id_template = cfg.get("bank_id_template", "") or ""
         # The static bank: the template's fallback and the mirror target, from one place.
-        self._static_bank_id = cfg.get("bank_id") or banks.get("bankId", "hermes")
+        self._static_bank_id = cfg.get("bank_id") or banks.get("bankId") or "hermes"
         # Precedence: closest .hindsight/config.toml in a trusted repository → template → static bank_id.
-        cwd_bank = _discover_cwd_bank_id(self._cwd, _normalize_string_list(cfg.get("trusted_project_dirs")))
+        # The repository is only looked up when something needs it, and only once.
+        trusted_dirs = _normalize_string_list(cfg.get("trusted_project_dirs"))
+        uses_project = "project" in _template_fields(self._bank_id_template)
+        root = _repository_root(self._cwd) if self._cwd and (trusted_dirs or uses_project) else None
+        self._project = _project_name(root) if uses_project else ""
+        cwd_bank = _discover_cwd_bank_id(self._cwd, root, trusted_dirs)
         if cwd_bank:
-            self._bank_id = cwd_bank
+            self._bank_id, self._bank_source = cwd_bank, "repository config"
         else:
-            # {project} walks the filesystem, so only when a template asks for it.
-            project = _derive_project_from_cwd(self._cwd) if "{project}" in self._bank_id_template else ""
             self._bank_id = _resolve_bank_id_template(
                 self._bank_id_template,
                 fallback=self._static_bank_id,
                 profile=self._agent_identity,
                 workspace=self._agent_workspace,
-                project=project,
+                project=self._project,
                 platform=self._platform,
                 user=self._user_id,
                 session=self._session_id,
             )
+            self._bank_source = "template" if self._bank_id_template else "bank_id"
         # Multi-bank write/recall (optional, default off): the deduped ordered
         # set used for write fan-out and prioritized recall merge.
         self._mirror_to_own_bank = bool(cfg.get("mirror_to_own_bank", False))
@@ -1121,7 +1135,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # a raw read here handed a multiplexed secondary the DEFAULT profile's retain shaping back.
             return cfg.get(key) or _scoped_setting(env_var, default)
 
-        self._retain_tags = _normalize_retain_tags(_cfg_or_env("retain_tags", "HINDSIGHT_RETAIN_TAGS"))
+        self._retain_tags = _normalize_string_list(_cfg_or_env("retain_tags", "HINDSIGHT_RETAIN_TAGS"))
         self._tags = self._retain_tags or None
         self._observation_scopes = _normalize_observation_scopes(
             _cfg_or_env("observation_scopes", "HINDSIGHT_RETAIN_OBSERVATION_SCOPES")
@@ -1287,19 +1301,26 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["types"] = self._recall_types
 
         async def _recall_all(client):
-            responses = await asyncio.gather(
-                *(client.arecall(bank_id=bank_id, **kwargs) for bank_id in bank_ids), return_exceptions=True
-            )
-            # Raising keeps the primary's single-bank contract and lets
-            # _run_hindsight_operation retry a stale embedded daemon.
-            if isinstance(responses[0], BaseException):
-                raise responses[0]
-            return responses
+            extra_timeout = float(self._timeout or _DEFAULT_TIMEOUT) * _EXTRA_BANK_TIMEOUT_SHARE
+            primary = asyncio.ensure_future(client.arecall(bank_id=bank_ids[0], **kwargs))
+            extras = [
+                asyncio.ensure_future(asyncio.wait_for(client.arecall(bank_id=bank_id, **kwargs), extra_timeout))
+                for bank_id in bank_ids[1:]
+            ]
+            try:
+                # Raising keeps the primary's single-bank contract and lets
+                # _run_hindsight_operation retry a stale embedded daemon.
+                first = await primary
+            except BaseException:
+                for task in extras:
+                    task.cancel()
+                raise
+            return [first, *await asyncio.gather(*extras, return_exceptions=True)]
 
         results, seen = [], set()
         for bank_id, resp in zip(bank_ids, self._run_hindsight_operation(_recall_all)):
             if isinstance(resp, BaseException):
-                logger.warning("Recall: skipping bank %s: %s", bank_id, resp)
+                self._log_bank_failure("recall", bank_id, resp)
                 continue
             for r in resp.results or []:
                 text = getattr(r, "text", None)
@@ -1434,7 +1455,7 @@ class HindsightMemoryProvider(MemoryProvider):
             "metadata": metadata or self._build_metadata(message_count=1, turn_index=self._turn_index),
             "timestamp": (occurred_at or "").strip() or _event_timestamp(),
         }
-        merged_tags = _normalize_retain_tags(list(self._retain_tags) + _normalize_retain_tags(tags))
+        merged_tags = _normalize_string_list(list(self._retain_tags) + _normalize_string_list(tags))
         item.update({k: v for k, v in (("context", context), ("update_mode", update_mode)) if v is not None})
         item.update({k: v for k, v in (("tags", merged_tags), ("observation_scopes", self._observation_scopes)) if v})
         return item
