@@ -61,6 +61,7 @@ from .settings import (
     _discover_cwd_bank_id,
     _normalize_observation_scopes,
     _normalize_retain_tags,
+    _normalize_string_list,
     _parse_int_setting,
     _resolve_bank_id_template,
 )
@@ -1086,15 +1087,14 @@ class HindsightMemoryProvider(MemoryProvider):
         # Multi-bank write/recall (optional, default off): the deduped ordered
         # set used for write fan-out and prioritized recall merge.
         self._mirror_to_own_bank = bool(cfg.get("mirror_to_own_bank", False))
-        self._additional_bank_ids = [
-            b.strip() for b in (cfg.get("additional_banks") or []) if isinstance(b, str) and b.strip()
-        ]
+        self._additional_bank_ids = _normalize_string_list(cfg.get("additional_banks"))
         self._write_bank_ids = self._build_write_bank_ids()
         # Recall-only banks (optional, default off): searched after the write
         # set, never written. ``recallAdditionalBanks`` is the name the
         # claude-code and omo integrations use for the same setting.
-        recall_only = cfg.get("recall_additional_banks") or cfg.get("recallAdditionalBanks") or []
-        self._recall_additional_bank_ids = [b.strip() for b in recall_only if isinstance(b, str) and b.strip()]
+        self._recall_additional_bank_ids = _normalize_string_list(
+            cfg.get("recall_additional_banks") or cfg.get("recallAdditionalBanks")
+        )
         budget = cfg.get("recall_budget") or cfg.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
         memory_mode = cfg.get("memory_mode", "hybrid")

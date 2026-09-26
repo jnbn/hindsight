@@ -219,3 +219,26 @@ def test_sync_turn_never_retains_to_recall_only_banks():
     provider._retain_queue.get_nowait()()
 
     assert retained_banks == ["primary", "shared"]
+
+
+def test_bank_lists_accept_comma_separated_text_from_the_settings_panel():
+    provider = _provider_with(
+        {
+            "bank_id": "primary",
+            "additional_banks": "shared, team",
+            "recall_additional_banks": "vault,notes",
+        }
+    )
+    assert provider._write_bank_ids == ["primary", "shared", "team"]
+    assert provider._build_recall_bank_ids() == ["primary", "shared", "team", "vault", "notes"]
+
+
+def test_bank_lists_accept_a_json_encoded_list():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": '["shared", "team"]'})
+    assert provider._write_bank_ids == ["primary", "shared", "team"]
+
+
+def test_empty_bank_list_text_means_no_extra_banks():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": "", "recall_additional_banks": " , "})
+    assert provider._write_bank_ids == ["primary"]
+    assert provider._build_recall_bank_ids() == ["primary"]

@@ -63,6 +63,16 @@ def _daemon_llm_provider(provider: str) -> str:
 
 def _normalize_retain_tags(value: Any) -> List[str]:
     """Normalize tag config/tool values to a deduplicated list of strings."""
+    return _normalize_string_list(value)
+
+
+def _normalize_string_list(value: Any) -> List[str]:
+    """Normalize a list-valued setting to a deduplicated list of non-empty strings.
+
+    Accepts a list, a JSON-encoded list (``'["a", "b"]'``) or a comma-separated string
+    (``"a, b"``), since the settings panel stores ``KIND_TEXT`` fields as text while
+    ``config.json`` written by hand usually holds a real list.
+    """
     if value is None:
         return []
     raw_items = value if isinstance(value, list) else [value]
