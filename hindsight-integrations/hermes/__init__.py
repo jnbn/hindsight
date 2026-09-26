@@ -1040,6 +1040,26 @@ class HindsightMemoryProvider(MemoryProvider):
                 ordered.append(bank)
         return ordered
 
+    @staticmethod
+    def _write_to_banks(bank_ids: list[str], write: Callable[[str], Any], *, label: str) -> None:
+        """Call *write* once per bank, isolating failures so one bank cannot stop the rest.
+
+        Every bank is attempted. A failing extra bank is logged and skipped; a failing
+        primary (first) bank is re-raised once the others have been tried, so callers
+        report a failed retain exactly as the single-bank path did.
+        """
+        primary_error: Exception | None = None
+        for index, bank_id in enumerate(bank_ids):
+            try:
+                write(bank_id)
+            except Exception as exc:
+                if index == 0:
+                    primary_error = exc
+                else:
+                    logger.warning("Hindsight %s: bank %s failed, continuing: %s", label, bank_id, exc)
+        if primary_error is not None:
+            raise primary_error
+
     def _build_recall_bank_ids(self) -> list[str]:
         """The banks recall searches: the write set (primary first), then each
         ``recall_additional_banks`` entry not already in it.
@@ -1458,7 +1478,8 @@ class HindsightMemoryProvider(MemoryProvider):
             item = self._build_retain_kwargs(
                 content, context=retain_context, metadata=metadata, tags=tags, update_mode=update_mode
             )
-            for bank_id in bank_ids:
+
+            def _write(bank_id: str) -> None:
                 logger.debug(
                     "Hindsight %s: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
                     label,
@@ -1474,6 +1495,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 # next-turn prefetch can wait for true server-side completion.
                 if retain_async and track_ops:
                     self._track_retain_ops(resp, bank_id)
+
+            self._write_to_banks(bank_ids, _write, label=label)
             logger.debug("Hindsight %s succeeded", label)
 
         return _job
@@ -1561,7 +1584,8 @@ class HindsightMemoryProvider(MemoryProvider):
         item = self._build_retain_kwargs(
             content, context=context, tags=args.get("tags"), occurred_at=args.get("occurred_at")
         )
-        for bank_id in list(getattr(self, "_write_bank_ids", None) or [self._bank_id]):
+
+        def _write(bank_id: str) -> None:
             logger.debug(
                 "Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                 bank_id,
@@ -1569,6 +1593,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 context,
             )
             self._retain_batch(item, bank_id=bank_id)
+
+        self._write_to_banks(
+            list(getattr(self, "_write_bank_ids", None) or [self._bank_id]), _write, label="tool retain"
+        )
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
 

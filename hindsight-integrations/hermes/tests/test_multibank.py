@@ -264,3 +264,61 @@ def test_single_bank_recall_error_reaches_the_tool_as_a_failure():
     result = provider.handle_tool_call("hindsight_recall", {"query": "q"})
     assert "Failed to search memory: connection refused" in result
     assert "No relevant memories found" not in result
+
+
+def _fake_retain(provider, failing: set) -> list:
+    """Record retained banks; raise for banks in *failing*."""
+    written = []
+
+    def retain_batch(item, bank_id, **kwargs):
+        written.append(bank_id)
+        if bank_id in failing:
+            raise RuntimeError(f"{bank_id} unavailable")
+        return SimpleNamespace(operation_id=f"op-{bank_id}")
+
+    provider._retain_batch = retain_batch
+    provider._ensure_writer = MagicMock()
+    provider._register_atexit = MagicMock()
+    return written
+
+
+def test_turn_retain_continues_past_a_failing_extra_bank(caplog):
+    provider = _provider_with({"bank_id": "primary", "additional_banks": ["broken", "shared"]})
+    written = _fake_retain(provider, failing={"broken"})
+
+    provider.sync_turn("User message", "Assistant reply", session_id="s1")
+    with caplog.at_level(logging.WARNING):
+        provider._retain_queue.get_nowait()()
+
+    assert written == ["primary", "broken", "shared"]
+    assert "bank broken failed" in caplog.text
+
+
+def test_turn_retain_still_raises_when_the_primary_fails_after_trying_the_rest():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": ["shared"]})
+    written = _fake_retain(provider, failing={"primary"})
+
+    provider.sync_turn("User message", "Assistant reply", session_id="s1")
+    with pytest.raises(RuntimeError, match="primary unavailable"):
+        provider._retain_queue.get_nowait()()
+    assert written == ["primary", "shared"]
+
+
+def test_retain_tool_reports_success_when_only_an_extra_bank_fails():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": ["broken"]})
+    written = _fake_retain(provider, failing={"broken"})
+
+    result = provider.handle_tool_call("hindsight_retain", {"content": "a fact"})
+
+    assert written == ["primary", "broken"]
+    assert "Memory stored successfully" in result
+
+
+def test_retain_tool_reports_failure_when_the_primary_fails():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": ["shared"]})
+    written = _fake_retain(provider, failing={"primary"})
+
+    result = provider.handle_tool_call("hindsight_retain", {"content": "a fact"})
+
+    assert written == ["primary", "shared"]
+    assert "Failed to store memory: primary unavailable" in result
