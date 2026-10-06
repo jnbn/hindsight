@@ -388,7 +388,7 @@ Setting both to `false` removes the built-in `memory` tool from the agent entire
 by setting the same flags back to `true`.
 
 If you keep the built-in stores on, every entry the agent adds or replaces in them is also saved to
-the bank, tagged `builtin-memory`, `builtin-target:<memory|user>` and `builtin-action:<add|replace>`,
+every bank Hindsight writes to, tagged `builtin-memory`, `builtin-target:<memory|user>` and `builtin-action:<add|replace>`,
 so a fact pruned from the size-capped file is not lost. Removals are not mirrored.
 
 ## Troubleshooting

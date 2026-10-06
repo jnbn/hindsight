@@ -560,3 +560,57 @@ def test_single_bank_recall_returns_the_server_response_unchanged():
 
     provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
     assert provider._recall("q") == results
+
+
+def _not_found() -> Exception:
+    from hindsight_client_api.exceptions import NotFoundException
+
+    return NotFoundException(status=404, reason="Not Found")
+
+
+def test_an_extra_bank_nothing_was_retained_to_is_empty_not_down(caplog):
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["fresh"]})
+    _fake_recall(provider, {"primary": ["from primary"], "fresh": _not_found()})
+
+    with caplog.at_level(logging.WARNING):
+        texts = [r.text for r in provider._recall("query")]
+
+    assert texts == ["from primary"]
+    assert "skipping bank fresh" not in caplog.text
+    assert provider._extra_bank_available("recall", "fresh")
+
+
+def test_a_primary_bank_nothing_was_retained_to_still_returns_the_extra_banks():
+    provider = _provider_with({"bank_id": "fresh", "recall_additional_banks": ["vault"]})
+    _fake_recall(provider, {"fresh": _not_found(), "vault": ["from vault"]})
+
+    assert [r.text for r in provider._recall("query")] == ["from vault"]
+
+
+def test_score_floors_apply_to_every_recall_bank():
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
+    provider._recall_min_scores = {"semantic": 0.5}
+    sent = []
+
+    class _Client:
+        async def arecall(self, bank_id, **kwargs):
+            sent.append(kwargs.get("min_scores"))
+            scores = {"primary": [("p-strong", 0.9), ("p-weak", 0.1)], "vault": [("v-strong", 0.8), ("v-weak", 0.2)]}
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=t, scores=SimpleNamespace(semantic=s)) for t, s in scores[bank_id]]
+            )
+
+    provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
+
+    assert [r.text for r in provider._recall("query")] == ["p-strong", "v-strong"]
+    assert sent == [{"semantic": 0.5}] * 2
+
+
+def test_builtin_memory_writes_reach_every_write_bank():
+    provider = _provider_with({"bank_id": "primary", "additional_banks": ["shared"], "recall_additional_banks": ["ro"]})
+    written = _fake_retain(provider, failing=set())
+
+    provider.on_memory_write("add", "memory", "Deploys go through Fly.io")
+    provider._retain_queue.get_nowait()()
+
+    assert written == ["primary", "shared"]

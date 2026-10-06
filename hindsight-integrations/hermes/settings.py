@@ -8,6 +8,8 @@ import logging
 import math
 import re
 import string
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List
 
@@ -200,23 +202,31 @@ def _repository_root(start_dir: str) -> Path | None:
     return None
 
 
-def _main_repository(root: Path) -> tuple[Path, bool]:
+@dataclass(frozen=True)
+class _MainRepository:
+    path: Path
+    bare: bool
+
+
+def _main_repository(root: Path) -> _MainRepository:
     """The main repository behind *root* and whether it is bare. A linked worktree's
     ``.git`` file names its ``gitdir``, whose ``commondir`` points at the shared git
     directory: ``<main>/.git`` for a normal checkout, the repository itself when bare.
     Anything else, submodules included, is its own main repository."""
     git_file = root / ".git"
     if not git_file.is_file():
-        return root, False
+        return _MainRepository(root, bare=False)
     text = git_file.read_text(encoding="utf-8").strip()
     if not text.startswith("gitdir:"):
-        return root, False
+        return _MainRepository(root, bare=False)
     gitdir = (root / text[len("gitdir:") :].strip()).resolve()
     commondir_file = gitdir / "commondir"
     if not commondir_file.is_file():
-        return root, False
+        return _MainRepository(root, bare=False)
     common = (gitdir / commondir_file.read_text(encoding="utf-8").strip()).resolve()
-    return (common.parent, False) if common.name == ".git" else (common, True)
+    if common.name == ".git":
+        return _MainRepository(common.parent, bare=False)
+    return _MainRepository(common, bare=True)
 
 
 def _project_name(root: Path | None) -> str:
@@ -225,8 +235,8 @@ def _project_name(root: Path | None) -> str:
     so a checkout in a folder named ``x.git`` and its worktrees all resolve to ``x.git``."""
     if root is None:
         return ""
-    main, bare = _main_repository(root)
-    return main.name.removesuffix(".git") if bare else main.name
+    main = _main_repository(root)
+    return main.path.name.removesuffix(".git") if main.bare else main.path.name
 
 
 def _discover_cwd_bank_id(start_dir: str, root: Path | None, trusted_dirs: List[str]) -> str | None:
@@ -242,8 +252,6 @@ def _discover_cwd_bank_id(start_dir: str, root: Path | None, trusted_dirs: List[
     """
     if root is None or not trusted_dirs:
         return None
-
-    import tomllib
 
     try:
         trusted = []

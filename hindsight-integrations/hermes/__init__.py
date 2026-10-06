@@ -1743,8 +1743,12 @@ class HindsightMemoryProvider(MemoryProvider):
             context=f"Hermes built-in {target} memory entry",
             tags=["builtin-memory", f"builtin-target:{target}", f"builtin-action:{action}"],
         )
-        bank_id, retain_async = self._bank_id, self._retain_async
-        self._enqueue_retain(lambda: self._retain_batch(item, bank_id=bank_id, retain_async=retain_async))
+        bank_ids, retain_async = list(self._write_bank_ids), self._retain_async
+        self._enqueue_retain(
+            lambda: self._write_to_banks(
+                bank_ids, lambda bank_id: self._retain_batch(item, bank_id=bank_id, retain_async=retain_async)
+            )
+        )
 
     def _enqueue_retain(self, job: Callable[[], None]) -> None:
         """Hand *job* to the (lazily started) writer and arm the atexit drain."""
